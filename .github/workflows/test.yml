@@ -1,0 +1,24 @@
+name: Regression tests
+on:
+  push:
+    paths: ['sm.sh', 'tests/**', '.github/workflows/test.yml']
+  pull_request:
+    paths: ['sm.sh', 'tests/**', '.github/workflows/test.yml']
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  debian:
+    strategy:
+      fail-fast: false
+      matrix:
+        release: ['12', '13']
+    runs-on: ubuntu-latest
+    container: debian:${{ matrix.release }}
+    steps:
+      - name: Install dependencies
+        run: apt-get update && DEBIAN_FRONTEND=noninteractive apt-get install -y supervisor git util-linux coreutils procps
+      - uses: actions/checkout@v5
+      - name: Syntax and regression scenarios
+        shell: bash
+        run: bash tests/regression.sh

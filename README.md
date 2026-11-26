@@ -1,15 +1,30 @@
 # Supervisor Manager (sm.sh)
 
-**纯 bash 实现的交互式 Supervisor 管理器**——零依赖、菜单驱动、按流程提示输入，参考 mdserver-web / 宝塔面板的 Supervisor 插件功能集，但跑在终端里而非浏览器里。
+**以 Bash 为主的交互式 Supervisor 管理器**——单文件、菜单驱动、复用 Supervisor 自带的 Python 解析器和系统 flock，参考 mdserver-web / 宝塔面板的 Supervisor 插件功能集，但跑在终端里而非浏览器里。
 
 设计目标与 [Supervisord TUI (god)](https://github.com/nicklasos/god) 不同：**不走 TUI 方向**，没有 vim 风格的全屏界面，就是普通的"打印标题 → 列菜单 → read 数字 → 进流程"，跟 `nvm` / `rvm` 那种用户体验类似。
+
+## v1.5.0：安全与稳定性更新
+
+- 优先识别运行中的 supervisord 配置、systemd unit 和常见发行版路径；无法确认时使用 `SM_MAIN_CONF=/absolute/path/supervisord.conf svm` 显式选择。
+- 控制命令统一传递主配置；使用 Supervisor 原生解析器验证配置，不启动额外 daemon。复杂或 ENV 动态 include 不自动猜测新增文件名。
+- 增删改使用 flock 互斥、0700 备份目录、0600 备份文件、临时文件与原子替换。解析或应用失败恢复磁盘配置，运行态恢复为尽力而为，不保证恢复原 PID、手工启停状态及业务副作用。
+- 局部操作拒绝已有待生效改动，只更新 reread 报告的变更组；全局重载需要确认。删除针对整个配置文件，不预先停止其他进程。
+- 新建进程 stdout 与 stderr 各采用 **8MB × (1 + 3) = 32MiB** 的轮转预算，合计 64MiB；单次日志写入可能短暂超限。已有配置及历史日志不自动改写或清理。
+- 新建进程默认 stopasgroup=true、killasgroup=true。日志路径使用运行态 RPC，日志查看不再编辑文件。敏感环境变量预览不回显。
+- 自身安装检查实际目标，先备份不同内容再原子替换；`svm --uninstall` 只卸载工具，不删除 Supervisor、业务配置或历史备份。
+- 仍为单文件部署，依赖 Bash、Supervisor 自带 Python 3、flock 和常见 Linux 工具（stat、mktemp、mv -T）。非标准 init、多实例及无法安全识别的配置需要人工确认。
+- MIT 许可证完整文本已嵌入脚本。
+- Debian 12/13 回归测试位于 tests/regression.sh，GitHub Actions 执行语法检查、配置匹配、备份、回滚及真实 Supervisor 进程组增删测试。容器测试不覆盖 systemd 开机恢复。
+
+以下旧版本说明为历史记录；有冲突时以本节为准。
 
 ## 首页长这样
 
 进入 `svm` 后，**不用点任何菜单就能看到所有受管进程的状态**——上方是状态看板，下方是操作菜单：
 
 ```
- Supervisor Manager v1.4.0
+ Supervisor Manager v1.5.0
 ====================================================================
   进程状态  共 9 个，运行 4，异常 5
   名称                        状态         PID      运行时长
@@ -205,7 +220,7 @@ SM_NO_ENTRY=1 source /usr/local/bin/svm   # 加载所有函数但不进入菜单
 | `SM_MAIN_CONF` | `/etc/supervisor/supervisord.conf` | 主配置文件 |
 | `SM_LOG_DIR` | `/var/log/supervisor` | 日志默认目录 |
 | `SM_RUN_DIR` | `/var/run/supervisor` | PID/run 目录 |
-| `SM_BACKUP_DIR` | `/var/backups/supervisor-manager` | 编辑/删除前的自动备份目录（不可写时退到 `/tmp`）|
+| `SM_BACKUP_DIR` | `/var/backups/supervisor-manager` | 编辑/删除前的自动备份目录（0700，不可写时拒绝修改）|
 | `SM_NO_CLEAR` | 未设置 | 设为 `1` 禁用首页清屏，保留终端滚动历史 |
 | `SM_WIDTH` | 未设置（68） | 固定界面总宽度；不设则默认 68，并在终端更窄时自动收窄 |
 | `SM_LOCALE` | 未设置（自适应） | `0` 关闭 locale 自适应；填具体 locale 名（如 `zh_CN.UTF-8`）则强制使用它 |
@@ -221,7 +236,7 @@ SM_NO_ENTRY=1 source /usr/local/bin/svm   # 加载所有函数但不进入菜单
 | 现象 | 排查 |
 | --- | --- |
 | 首页显示 `supervisord 未运行` | 选菜单 `2` 启用开机自启 + 立即启动 |
-| 首页显示 `无权访问 supervisord socket` | 用 `sudo` 运行本工具，或放宽主配置 `[unix_http_server] chmod` |
+| 首页显示 `无权访问 supervisord socket` | 用 `sudo` 运行本工具，并检查 socket 所属用户，不要随意放宽权限 |
 | `socket not found` | 检查主配置 `[unix_http_server] file=...` 与 `[supervisorctl] serverurl=unix://...` 是否一致 |
 | 添加进程后状态 FATAL | `supervisorctl tail <name> stderr` 看真实错误；多数是 `command` 路径不对或权限 |
 | 改完主配置不生效 | 主配置改端口/socket 必须重启，reread 不够；菜单 `11` 会提示并可直接确认重启 |
