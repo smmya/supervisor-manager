@@ -1,4 +1,26 @@
 #!/usr/bin/env bash
+# SPDX-License-Identifier: MIT
+# MIT License
+#
+# Copyright (c) 2026 smmya
+#
+# Permission is hereby granted, free of charge, to any person obtaining a copy
+# of this software and associated documentation files (the "Software"), to deal
+# in the Software without restriction, including without limitation the rights
+# to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+# copies of the Software, and to permit persons to whom the Software is
+# furnished to do so, subject to the following conditions:
+#
+# The above copyright notice and this permission notice shall be included in all
+# copies or substantial portions of the Software.
+#
+# THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+# IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+# FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+# AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+# LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+# OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+# SOFTWARE.
 # ============================================================================
 #  sm.sh - Supervisor Manager (interactive shell, menu-driven)
 #  参考 mdserver-web / 宝塔 supervisor 插件功能集，纯 bash 实现。
@@ -17,11 +39,15 @@
 # 改为各 action 内部显式 return/error 处理。
 set -uo pipefail
 
-SM_VERSION="1.4.0"
+SM_VERSION="1.5.0"
 
 # 配置默认值（可被环境变量覆盖）
 SM_CONF_DIR="${SM_CONF_DIR:-/etc/supervisor/conf.d}"
+_SM_CONF_EXPLICIT=0
+[[ -n "${SM_MAIN_CONF:-}" ]] && _SM_CONF_EXPLICIT=1
 SM_MAIN_CONF="${SM_MAIN_CONF:-/etc/supervisor/supervisord.conf}"
+_SM_CONF_AMBIGUOUS=0
+_SM_DAEMON_PID=""
 SM_LOG_DIR="${SM_LOG_DIR:-/var/log/supervisor}"
 SM_RUN_DIR="${SM_RUN_DIR:-/var/run/supervisor}"
 # 编辑前的自动备份目录（宁可多占几 KB，也别让改坏配置变成不可逆事故）
@@ -433,157 +459,221 @@ _open_editor() {
 # ============================================================================
 
 # 提取主配置 [include] 段的 files 值（支持多行续行、空格分隔多个 glob）
-_conf_include_patterns() {
-    local main="${1:-$SM_MAIN_CONF}"
-    [[ -f "$main" ]] || return 1
-    awk '
-        /^[[:space:]]*\[/ {
-            ininc = ($0 ~ /^[[:space:]]*\[include\][[:space:]]*$/)
-            join = 0
-            next
-        }
-        ininc && /^[[:space:]]*files[[:space:]]*=/ {
-            v = $0
-            sub(/^[[:space:]]*files[[:space:]]*=[[:space:]]*/, "", v)
-            print v
-            join = 1
-            next
-        }
-        ininc && join && /^[[:space:]]+[^[:space:]]/ {
-            print $0
-            next
-        }
-        { join = 0 }
-    ' "$main" 2>/dev/null
-}
 
-# 把 include 的 glob 展开成实际存在的文件；相对路径按主配置所在目录解析
-_conf_include_files() {
-    local main="${SM_MAIN_CONF}"
-    [[ -f "$main" ]] || return 1
-    local maindir; maindir=$(dirname "$main")
-    local line tok f
-    local -a pats=()
-    while IFS= read -r line; do
-        [[ -z "${line//[[:space:]]/}" ]] && continue
-        for tok in $line; do
-            case "$tok" in
-                ';'*|'#'*) continue ;;
-            esac
-            # Python ConfigParser 注释也允许行内 ; 之后的内容
-            tok="${tok%%;*}"
-            [[ -z "$tok" ]] && continue
-            [[ "$tok" == /* ]] || tok="$maindir/$tok"
-            pats+=("$tok")
-        done
-    done < <(_conf_include_patterns "$main")
-
-    (( ${#pats[@]} )) || return 1
-    local p
-    for p in "${pats[@]}"; do
-        while IFS= read -r f; do
-            [[ -n "$f" && -f "$f" ]] && printf '%s\n' "$f"
-        done < <(compgen -G "$p" 2>/dev/null)
-    done
-}
-
-# 本机所有会被 supervisord 加载的进程配置文件
-# 优先 include；解析不到时退回常见默认位置（老部署 / 主配置缺失）
-_conf_source_files() {
-    local f found=0
-    while IFS= read -r f; do
-        [[ -n "$f" ]] && { printf '%s\n' "$f"; found=1; }
-    done < <(_conf_include_files)
-    (( found == 1 )) && return 0
-
-    for f in "$SM_CONF_DIR"/*.conf "$SM_CONF_DIR"/*.ini \
-             /etc/supervisord.d/*.conf /etc/supervisord.d/*.ini \
-             /etc/supervisor/conf.d/*.conf /etc/supervisor/conf.d/*.ini; do
-        [[ -f "$f" && "$f" != "$SM_MAIN_CONF" ]] && printf '%s\n' "$f"
-    done
-}
-
-# 计算「添加守护进程」的落点：目录 + 扩展名
-# 结果写入全局 _SM_TARGET_DIR / _SM_TARGET_EXT
-# 依据 include 里第一个可用的 glob，例如 files=/etc/supervisord.d/*.ini
-#   → 目录 /etc/supervisord.d，后缀 .ini
-# 关键：后缀也必须对齐。只把目录改对、仍写 .conf 的话，在 *.ini 的机器上
-# 文件永远不会被加载，表现为"添加成功但进程一直不出现"
-_preferred_conf_target() {
-    local main="$SM_MAIN_CONF"
-    local maindir; maindir=$(dirname "$main")
-    local line tok base ext d tail_part
-    _SM_TARGET_DIR="$SM_CONF_DIR"
-    _SM_TARGET_EXT=".conf"
-    while IFS= read -r line; do
-        for tok in $line; do
-            case "$tok" in ';'*|'#'*) continue ;; esac
-            tok="${tok%%;*}"
-            [[ -z "$tok" ]] && continue
-            [[ "$tok" == /* ]] || tok="$maindir/$tok"
-            d="${tok%/*}"
-            [[ -d "$d" ]] || continue
-            base="${tok##*/}"
-            ext=""
-            if [[ "$base" == *.* ]]; then
-                tail_part="${base##*.}"
-                # 后缀部分带通配符时不可用（如 "*" 本身）
-                [[ "$tail_part" != *"*"* && "$tail_part" != *"?"* ]] && ext=".$tail_part"
-            fi
-            _SM_TARGET_DIR="$d"
-            _SM_TARGET_EXT="$ext"
-            return 0
-        done
-    done < <(_conf_include_patterns "$main")
-    return 0
-}
-
-# 某个 [program:name] 是否已被任何被加载的配置定义
-_program_exists() {
-    local name="$1" f
-    while IFS= read -r f; do
-        [[ -n "$f" && -f "$f" ]] || continue
-        if awk -v sec="[program:${name}]" '
-            /^\[/ { if ($0 == sec) { found = 1; exit } }
-            END { exit(found ? 0 : 1) }
-        ' "$f" 2>/dev/null; then
-            return 0
+# Reuse Supervisor's installed Python interpreter for its native parser.
+_supervisor_python() {
+    local sup line candidate
+    local -a words=()
+    sup=$(command -v supervisord) || return 1
+    IFS= read -r line < "$sup" || return 1
+    if [[ "$line" == '#!'* ]]; then
+        read -r -a words <<< "${line:2}"
+        candidate="${words[0]:-}"
+        if [[ "${candidate##*/}" == env ]]; then candidate="${words[1]:-}"; fi
+        if [[ -n "$candidate" ]] && "$candidate" -c 'import supervisor.options' >/dev/null 2>&1; then
+            printf '%s\n' "$candidate"; return 0
         fi
-    done < <( { _conf_source_files; [[ -f "$SM_MAIN_CONF" ]] && printf '%s\n' "$SM_MAIN_CONF"; } )
+    fi
+    for candidate in python3 python; do
+        if "$candidate" -c 'import supervisor.options' >/dev/null 2>&1; then
+            printf '%s\n' "$candidate"; return 0
+        fi
+    done
+    ui_error "找不到 Supervisor 自带的 Python 解析器" >&2
     return 1
 }
 
-# 从配置文件中解析指定进程的某个键值（支持 numprocs 实例 name:N 与组汇总 name:*）
-# 用法: _lookup_key <进程名> <键名>
-_lookup_key() {
-    local proc_name="$1" key="$2"
-    # numprocs 实例 / 组汇总：worker:0、group:* → 找 [program:worker] / [program:...]
-    local search_name="$proc_name"
-    [[ "$search_name" == *:* ]] && search_name="${search_name%%:*}"
+_native_conf() {
+    local py
+    py=$(_supervisor_python) || return 1
+    "$py" - "$@" <<'PY'
+import glob
+import os
+import platform
+import sys
+from supervisor.options import UnhosedConfigParser, ServerOptions, ClientOptions, expand
 
-    local -a files=()
-    local f
-    while IFS= read -r f; do [[ -n "$f" ]] && files+=("$f"); done < <(_conf_source_files)
-    # 进程也可能直接定义在主配置里
-    [[ -f "$SM_MAIN_CONF" ]] && files+=("$SM_MAIN_CONF")
-    [[ ${#files[@]} -eq 0 ]] && { printf ''; return 0; }
+mode, main = sys.argv[1:3]
+main = os.path.abspath(main)
+here = os.path.dirname(main)
 
-    local file
-    file=$(awk -v k="$key" -v sec="[program:${search_name}]" '
-        /^\[/ { insec = ($0 == sec) }
-        insec && index($0, k "=") == 1 { sub(/^[^=]*=/, ""); print; exit }
-    ' "${files[@]}" 2>/dev/null)
+def parser_for(path):
+    p = UnhosedConfigParser()
+    with open(path) as f:
+        p.read_file(f)
+    return p
 
-    # 去除首尾空白
-    file="${file#"${file%%[![:space:]]*}"}"
-    file="${file%"${file##*[![:space:]]}"}"
-    printf '%s' "$file"
+try:
+    if mode == 'validate':
+        ServerOptions().realize(args=['-c', main])
+        ClientOptions().realize(args=['-c', main, 'pid'])
+    elif mode == 'log':
+        c = ClientOptions()
+        c.realize(args=['-c', main, 'pid'])
+        p = c.getServerProxy().supervisor.getProcessInfo(sys.argv[3])
+        value = p.get(sys.argv[4] + '_logfile', '')
+        if value:
+            print(value)
+    else:
+        p = parser_for(main)
+        if mode == 'entities':
+            for section in p.sections():
+                print(section)
+            sys.exit(0)
+        patterns = []
+        if p.has_section('include'):
+            value = p.get('include', 'files')
+            if '%(ENV_' in value:
+                raise ValueError('ENV-dependent include requires explicit paths')
+            value = expand(value, {'here': here, 'host_node_name': platform.node()}, 'include.files')
+            patterns = [os.path.normpath(os.path.join(here, x)) for x in value.split()]
+        if mode == 'patterns':
+            for pattern in patterns:
+                print(pattern)
+        else:
+            files = sorted(set(os.path.normpath(f) for pattern in patterns
+                               for f in glob.glob(pattern) if os.path.isfile(f)))
+            if mode == 'files':
+                for f in files:
+                    print(f)
+            elif mode == 'names':
+                for f in [main] + files:
+                    for section in parser_for(f).sections():
+                        if section.startswith(('program:', 'group:', 'eventlistener:', 'fcgi-program:')):
+                            print(section.split(':', 1)[1])
+            else:
+                raise ValueError('unknown mode')
+except Exception as e:
+    print('配置解析失败: %s' % e, file=sys.stderr)
+    sys.exit(1)
+PY
 }
 
-# ui_menu "标题" "选项1" "选项2" ...
-# ui_menu --bare "标题" "选项1" ...   → 跳过标题渲染（用于调用方已自绘表头，如首页看板）
-# 选中索引写入 _SM_MENU_CHOICE（0 表示返回），返回 0
-# EOF 返回 1
+_conf_include_patterns() { _native_conf patterns "${1:-$SM_MAIN_CONF}"; }
+_conf_include_files() { _native_conf files "$SM_MAIN_CONF"; }
+_conf_source_files() { _conf_include_files; }
+
+_preferred_conf_target() {
+    local name="$1" patterns pattern dir base candidate
+    patterns=$(_conf_include_patterns) || return 1
+    _SM_TARGET_FILE=""
+    while IFS= read -r pattern; do
+        [[ -n "$pattern" ]] || continue
+        dir="${pattern%/*}"; base="${pattern##*/}"
+        [[ "$dir" != *[\*\?\[]* && -d "$dir" ]] || continue
+        [[ "$base" == *'*'* && "$base" != *[\?\[]* ]] || continue
+        [[ "${base#*\*}" != *'*'* ]] || continue
+        candidate="$dir/${base/\*/$name}"
+        [[ "${candidate##*/}" == $base ]] || continue
+        [[ ! -e "$candidate" && ! -L "$candidate" ]] || continue
+        _SM_TARGET_FILE="$candidate"; return 0
+    done <<< "$patterns"
+    ui_error "无安全的 include 写入目标，或目标已存在"
+    return 1
+}
+
+_program_exists() {
+    local names
+    names=$(_native_conf names "$SM_MAIN_CONF") || return 2
+    grep -Fxq -- "$1" <<< "$names"
+}
+
+_lookup_key() {
+    local stream
+    case "$2" in stdout_logfile) stream=stdout;; stderr_logfile) stream=stderr;; *) return 1;; esac
+    _native_conf log "$SM_MAIN_CONF" "$1" "$stream"
+}
+
+_daemon_config() {
+    local pid="$1" arg prev=""
+    while IFS= read -r -d '' arg; do
+        case "$prev" in -c|--configuration) printf '%s\n' "$arg"; return 0;; esac
+        case "$arg" in --configuration=*) printf '%s\n' "${arg#*=}"; return 0;; -c?*) printf '%s\n' "${arg:2}"; return 0;; esac
+        prev="$arg"
+    done < "/proc/$pid/cmdline"
+    return 1
+}
+
+_discover_main_conf() {
+    _SM_CONF_AMBIGUOUS=0; _SM_DAEMON_PID=""
+    local proc arg pid path detected="" unit exec_line
+    local -a pids=() candidates=()
+    if (( _SM_CONF_EXPLICIT )); then
+        [[ "$SM_MAIN_CONF" == /* ]] || SM_MAIN_CONF="$PWD/$SM_MAIN_CONF"
+        return 0
+    fi
+    for proc in /proc/[0-9]*/comm; do
+        { IFS= read -r arg < "$proc"; } 2>/dev/null || continue
+        [[ "$arg" == supervisord ]] || continue
+        pid="${proc#/proc/}"; pids+=("${pid%/comm}")
+    done
+    if (( ${#pids[@]} > 1 )); then _SM_CONF_AMBIGUOUS=1; return 1; fi
+    if (( ${#pids[@]} == 1 )); then
+        _SM_DAEMON_PID="${pids[0]}"
+        detected=$(_daemon_config "$_SM_DAEMON_PID") || detected=""
+        if [[ -n "$detected" ]]; then
+            if [[ "$detected" != /* || ! -f "$detected" ]]; then _SM_CONF_AMBIGUOUS=1; return 1; fi
+            SM_MAIN_CONF="$detected"; return 0
+        fi
+    fi
+    if [[ -d /run/systemd/system ]]; then
+        for unit in supervisor supervisord; do
+            exec_line=$(systemctl show "$unit" -p ExecStart --value 2>/dev/null) || continue
+            if [[ "$exec_line" =~ [[:space:]](-c|--configuration)[[:space:]]+([^[:space:]\;\}]+) ]]; then
+                path="${BASH_REMATCH[2]}"
+                [[ "$path" == /* && -f "$path" ]] && candidates+=("$path")
+            fi
+        done
+    fi
+    if (( ${#candidates[@]} == 0 )); then
+        for path in /etc/supervisor/supervisord.conf /etc/supervisord.conf /usr/local/etc/supervisord.conf; do
+            [[ -f "$path" ]] && candidates+=("$path")
+        done
+    fi
+    if (( ${#candidates[@]} > 1 )); then
+        for path in "${candidates[@]}"; do
+            if [[ "$path" != "${candidates[0]}" && ! "$path" -ef "${candidates[0]}" ]]; then _SM_CONF_AMBIGUOUS=1; return 1; fi
+        done
+    fi
+    if (( ${#candidates[@]} )); then SM_MAIN_CONF="${candidates[0]}"; fi
+    if [[ -n "$_SM_DAEMON_PID" && ! -f "$SM_MAIN_CONF" ]]; then _SM_CONF_AMBIGUOUS=1; return 1; fi
+    return 0
+}
+
+_conf_ready() {
+    if (( _SM_CONF_AMBIGUOUS )); then
+        ui_error "配置路径不明确；请显式设置 SM_MAIN_CONF" >&2; return 1
+    fi
+    [[ -f "$SM_MAIN_CONF" ]] || { ui_error "未找到主配置: $SM_MAIN_CONF" >&2; return 1; }
+}
+
+_svctl() {
+    _conf_ready || return 1
+    case "${1:-}" in
+        pid|status)
+            if command -v timeout >/dev/null 2>&1; then
+                timeout 5 supervisorctl -c "$SM_MAIN_CONF" "$@"; return $?
+            fi;;
+    esac
+    command supervisorctl -c "$SM_MAIN_CONF" "$@"
+}
+
+_check_daemon_identity() {
+    local pid comm detected
+    pid=$(_svctl pid 2>/dev/null) || return 1
+    [[ "$pid" =~ ^[0-9]+$ && -r "/proc/$pid/comm" ]] || return 1
+    IFS= read -r comm < "/proc/$pid/comm" || return 1
+    [[ "$comm" == supervisord ]] || return 1
+    [[ -z "$_SM_DAEMON_PID" || "$pid" == "$_SM_DAEMON_PID" ]] || return 1
+    detected=$(_daemon_config "$pid") || detected=""
+    if [[ -n "$detected" ]]; then
+        [[ "$detected" == /* && "$detected" -ef "$SM_MAIN_CONF" ]] || return 1
+    else
+        [[ -n "$_SM_DAEMON_PID" ]] || return 1
+    fi
+    return 0
+}
+
 ui_menu() {
     local bare=0
     local zero_label="返回"
@@ -671,13 +761,13 @@ has_supervisord() { command -v supervisord >/dev/null 2>&1; }
 # supervisorctl pid 才是可靠的存活探测：socket 通就返回 supervisord 的 PID 且退出 0。
 supervisor_alive() {
     has_supervisord || return 1
-    supervisorctl pid >/dev/null 2>&1
+    _svctl pid >/dev/null 2>&1
 }
 
 # 检测失败原因：区分"未启动"与"无权限访问 socket"
 _supervisor_diag() {
     local err
-    err=$(supervisorctl pid 2>&1 >/dev/null)
+    err=$(_svctl pid 2>&1 >/dev/null)
     if [[ "$err" == *"no such file"* || "$err" == *"refused"* || "$err" == *"不"* ]]; then
         echo "not_running"
     elif [[ "$err" == *"permission"* || "$err" == *"Permission"* || "$err" == *"EACCES"* || "$err" == *"denied"* ]]; then
@@ -953,16 +1043,16 @@ _list_proc_names() {
     if ! supervisor_alive; then return 0; fi
     # 原样列出第一列：包括 numprocs 实例（name:0/name:1）与组汇总（group:*）
     # supervisorctl 原生支持这些语法，无需也不能过滤
-    supervisorctl status 2>/dev/null | awk 'NF {print $1}'
+    _svctl status 2>/dev/null | awk 'NF {print $1}'
 }
 
 # 读取状态原始输出（首页每轮菜单都会调用）
 # 加 5 秒超时上限：socket 卡死时不会把整个菜单拖住；没有 timeout 命令则退化为直接调用
 _supervisor_status_raw() {
     if command -v timeout >/dev/null 2>&1; then
-        timeout 5 supervisorctl status 2>/dev/null
+        _svctl status 2>/dev/null
     else
-        supervisorctl status 2>/dev/null
+        _svctl status 2>/dev/null
     fi
 }
 
@@ -1127,10 +1217,14 @@ action_add() {
         ui_pause; return 1
     fi
     # 写入位置必须以 include 为准：目录和后缀都要对，否则 supervisord 永远不会加载
-    _preferred_conf_target
-    local conf_dir="$_SM_TARGET_DIR"
-    local target="$conf_dir/$name$_SM_TARGET_EXT"
-    if _program_exists "$name"; then
+    _conf_ready || return 1
+    _preferred_conf_target "$name" || return 1
+    local target="$_SM_TARGET_FILE"
+    local conf_dir="${target%/*}"
+    local name_rc=0
+    _program_exists "$name" || name_rc=$?
+    (( name_rc == 1 )) || { ui_error "名称重复或解析失败"; return 1; }
+    if [[ -e "$target" || -L "$target" ]]; then
         ui_error "已存在同名进程 [program:$name]，请改用菜单 [8] 编辑"
         ui_pause; return 1
     fi
@@ -1195,10 +1289,10 @@ action_add() {
         echo "priority=$priority"
         echo "stdout_logfile=$stdout_log"
         echo "stderr_logfile=$stderr_log"
-        echo "stdout_logfile_maxbytes=10MB"
-        echo "stdout_logfile_backups=10"
-        echo "stderr_logfile_maxbytes=10MB"
-        echo "stderr_logfile_backups=10"
+        echo "stdout_logfile_maxbytes=8MB"
+        echo "stdout_logfile_backups=3"
+        echo "stderr_logfile_maxbytes=8MB"
+        echo "stderr_logfile_backups=3"
         # 注意：必须用 if 语句，不能写 `[[ -n "$x" ]] && echo ...`
         # 否则 env 为空时该判断返回 1，整个 { } 重定向组被判为“写入失败”（文件其实已写成功）
         if [[ -n "$env_str" ]]; then
@@ -1220,7 +1314,7 @@ action_add() {
     if supervisor_alive; then
         ui_info "执行 reread + update ..."
         local reread_out update_out
-        reread_out=$(supervisorctl reread 2>&1) || true
+        reread_out=$(_svctl reread 2>&1) || true
         [[ -n "$reread_out" ]] && echo "$reread_out"
         if [[ "$reread_out" == *"ERROR"* ]]; then
             ui_error "reread 失败，配置可能有语法错误"
@@ -1229,7 +1323,7 @@ action_add() {
             ui_pause; return 1
         fi
 
-        update_out=$(supervisorctl update 2>&1) || true
+        update_out=$(_svctl update 2>&1) || true
         [[ -n "$update_out" ]] && echo "$update_out"
         if [[ "$update_out" == *"ERROR"* ]]; then
             ui_error "update 失败"
@@ -1241,11 +1335,11 @@ action_add() {
             ui_info "autostart=true，update 已自动启动该进程"
         else
             if ui_confirm "autostart=false，是否立即启动该进程?"; then
-                supervisorctl start "$name" || true
+                _svctl start "$name" || true
             fi
         fi
         ui_success "添加完成。当前状态："
-        supervisorctl status "$name" 2>/dev/null || true
+        _svctl status "$name" 2>/dev/null || true
     else
         ui_warn "supervisord 未运行，启动后新进程会按 autostart 自动拉起"
     fi
@@ -1296,7 +1390,7 @@ _action_ctl() {
     local target="$_SM_TARGET"
     [[ -n "$target" ]] || { ui_warn "未选择目标"; ui_pause; return 0; }
     ui_info "执行 supervisorctl $cmd $target ..."
-    if supervisorctl "$cmd" "$target"; then
+    if _svctl "$cmd" "$target"; then
         ui_success "${op}完成"
     else
         ui_error "${op}失败"
@@ -1336,10 +1430,10 @@ action_log() {
     [[ "$act" -eq 0 ]] && { ui_pause; return 0; }
 
     case "$act" in
-        1) supervisorctl tail "$name" stdout ;;
-        2) supervisorctl tail "$name" stderr ;;
-        3) echo -e "${C_GRAY}Ctrl+C 退出${C_RESET}"; supervisorctl tail -f "$name" stdout ;;
-        4) echo -e "${C_GRAY}Ctrl+C 退出${C_RESET}"; supervisorctl tail -f "$name" stderr ;;
+        1) _svctl tail "$name" stdout ;;
+        2) _svctl tail "$name" stderr ;;
+        3) echo -e "${C_GRAY}Ctrl+C 退出${C_RESET}"; _svctl tail -f "$name" stdout ;;
+        4) echo -e "${C_GRAY}Ctrl+C 退出${C_RESET}"; _svctl tail -f "$name" stderr ;;
         5|6)
             local key
             if [[ "$act" -eq 5 ]]; then key=stdout_logfile; else key=stderr_logfile; fi
@@ -1411,7 +1505,7 @@ _backup_file() {
 # 仍在用内存里的旧配置。这是"编辑配置后没反应"最常见的原因。
 _do_reload() {
     local out rc
-    out=$(supervisorctl reread 2>&1); rc=$?
+    out=$(_svctl reread 2>&1); rc=$?
     [[ -n "$out" ]] && printf '%s\n' "$out"
     if (( rc != 0 )) || [[ "$out" == *ERROR* ]]; then
         ui_error "reread 失败：配置有语法错误，本次改动未生效"
@@ -1420,7 +1514,7 @@ _do_reload() {
         return 1
     fi
 
-    out=$(supervisorctl update 2>&1); rc=$?
+    out=$(_svctl update 2>&1); rc=$?
     [[ -n "$out" ]] && printf '%s\n' "$out"
     if (( rc != 0 )) || [[ "$out" == *ERROR* ]]; then
         ui_error "update 失败：新配置未完全应用"
@@ -1608,7 +1702,7 @@ action_delete() {
 
     if supervisor_alive && [[ ${#ents[@]} -gt 0 ]]; then
         ui_info "停止进程: ${ents[*]}"
-        supervisorctl stop "${ents[@]}" 2>&1 || ui_warn "停止失败（进程可能已停止或状态转换中）"
+        _svctl stop "${ents[@]}" 2>&1 || ui_warn "停止失败（进程可能已停止或状态转换中）"
     fi
 
     # 删除前留一份，误删可恢复
@@ -1713,6 +1807,7 @@ action_edit_main() {
 
 main_menu() {
     while true; do
+        _discover_main_conf || true
         # 首页 = 状态看板 + 菜单（一屏看完，不用再单独进"查看状态"）
         # _SM_SKIP_CLEAR=1 用于跳过本次清屏（看日志回来时保留刚读到的内容）
         if [[ "${_SM_SKIP_CLEAR:-0}" == "1" ]]; then
@@ -2040,6 +2135,7 @@ _fit_width
 # source 模式（SM_NO_ENTRY=1）跳过——改调用方的全局环境不是被加载者该做的事
 if [[ "${SM_NO_ENTRY:-0}" != "1" ]]; then
     _ensure_utf8_locale
+    _discover_main_conf || true
 fi
 
 # 解析参数（source 模式下 $# 是调用方的参数，不能当成自己的命令行来解析）
@@ -2060,7 +2156,7 @@ if [[ $# -ge 1 && "${SM_NO_ENTRY:-0}" != "1" ]]; then
             case "$2" in
                 status)
                     if supervisor_alive; then
-                        supervisorctl status
+                        _svctl status
                     else
                         _report_not_alive
                         exit 1
@@ -2070,7 +2166,7 @@ if [[ $# -ge 1 && "${SM_NO_ENTRY:-0}" != "1" ]]; then
                 boot)    action_boot ;;
                 *) ui_error "未知命令: $2"; exit 1 ;;
             esac
-            exit 0
+            exit $?
             ;;
         --version|-V)
             echo "Supervisor Manager v$SM_VERSION"
