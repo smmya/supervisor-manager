@@ -39,7 +39,7 @@
 # 改为各 action 内部显式 return/error 处理。
 set -uo pipefail
 
-SM_VERSION="1.5.0"
+SM_VERSION="1.6.0"
 
 # 配置默认值（可被环境变量覆盖）
 SM_CONF_DIR="${SM_CONF_DIR:-/etc/supervisor/conf.d}"
@@ -48,6 +48,16 @@ _SM_CONF_EXPLICIT=0
 SM_MAIN_CONF="${SM_MAIN_CONF:-/etc/supervisor/supervisord.conf}"
 _SM_CONF_AMBIGUOUS=0
 _SM_DAEMON_PID=""
+_SM_PROFILE="${SM_PROFILE:-auto}"
+_SM_PROFILE_ENV=0
+[[ -n "${SM_PROFILE:-}" || -n "${SM_SUPERVISORD:-}" || -n "${SM_SUPERVISORCTL:-}" || "$_SM_CONF_EXPLICIT" == 1 ]] && _SM_PROFILE_ENV=1
+_SM_PROFILE_LOCKED=0
+_SM_DAEMON="${SM_SUPERVISORD:-}"
+_SM_CTL="${SM_SUPERVISORCTL:-}"
+_SM_UNIT="${SM_SERVICE:-}"
+_SM_PROFILE_FILE="${SM_PROFILE_FILE:-/etc/supervisor-manager/instance.conf}"
+_SM_LOG_EXPLICIT=0
+[[ -n "${SM_LOG_DIR:-}" ]] && _SM_LOG_EXPLICIT=1
 SM_LOG_DIR="${SM_LOG_DIR:-/var/log/supervisor}"
 SM_RUN_DIR="${SM_RUN_DIR:-/var/run/supervisor}"
 # 编辑前的自动备份目录（宁可多占几 KB，也别让改坏配置变成不可逆事故）
@@ -464,7 +474,8 @@ _open_editor() {
 _supervisor_python() {
     local sup line candidate
     local -a words=()
-    sup=$(command -v supervisord) || return 1
+    sup="$_SM_DAEMON"
+    [[ -x "$sup" ]] || return 1
     IFS= read -r line < "$sup" || return 1
     if [[ "$line" == '#!'* ]]; then
         read -r -a words <<< "${line:2}"
@@ -474,11 +485,7 @@ _supervisor_python() {
             printf '%s\n' "$candidate"; return 0
         fi
     fi
-    for candidate in python3 python; do
-        if "$candidate" -c 'import supervisor.options' >/dev/null 2>&1; then
-            printf '%s\n' "$candidate"; return 0
-        fi
-    done
+    # Do not silently use the system Python for a different installation.
     ui_error "找不到 Supervisor 自带的 Python 解析器" >&2
     return 1
 }
@@ -594,57 +601,237 @@ _daemon_config() {
     return 1
 }
 
-_discover_main_conf() {
-    _SM_CONF_AMBIGUOUS=0; _SM_DAEMON_PID=""
-    local proc arg pid path detected="" unit exec_line
-    local -a pids=() candidates=()
-    if (( _SM_CONF_EXPLICIT )); then
-        [[ "$SM_MAIN_CONF" == /* ]] || SM_MAIN_CONF="$PWD/$SM_MAIN_CONF"
-        return 0
+
+# A profile binds all tools, the configuration and optionally a systemd unit.
+_profile_paths() {
+    local kind="$1" daemon="" ctl="" conf="" p
+    case "$kind" in
+        package)
+            for p in /usr/bin/supervisord /usr/sbin/supervisord; do
+                [[ -x "$p" ]] && { daemon="$p"; break; }
+            done
+            for p in /usr/bin/supervisorctl /usr/sbin/supervisorctl; do
+                [[ -x "$p" ]] && { ctl="$p"; break; }
+            done
+            for p in /etc/supervisor/supervisord.conf /etc/supervisord.conf; do
+                [[ -f "$p" ]] && { conf="$p"; break; }
+            done
+            # A service's actual package configuration takes precedence if it uses the selected executable.
+            if [[ -d /run/systemd/system && -n "$daemon" ]]; then
+                local unit line d c
+                for unit in supervisor supervisord; do
+                    line=$(systemctl show "$unit" -p ExecStart --value 2>/dev/null) || continue
+                    d=$(_unit_daemon_from_line "$line") || continue
+                    [[ "$d" -ef "$daemon" ]] || continue
+                    c=$(_unit_config_from_line "$line") || continue
+                    [[ -f "$c" && "$c" != /www/server/supervisor/* ]] || continue
+                    conf="$c"; break
+                done
+            fi
+            ;;
+        mw)
+            conf=/www/server/supervisor/supervisor.conf
+            for p in /www/server/mdserver-web/bin /www/server/mdserver-web/venv/bin /www/server/mdserver-web/pyenv/bin; do
+                if [[ -x "$p/supervisord" && -x "$p/supervisorctl" ]]; then
+                    daemon="$p/supervisord"; ctl="$p/supervisorctl"; break
+                fi
+            done
+            # MW can also install supervisor into /usr/local/bin without a virtualenv.
+            if [[ -z "$daemon" && -f "$conf" ]]; then
+                for p in /usr/local/bin /usr/bin; do
+                    if [[ -x "$p/supervisord" && -x "$p/supervisorctl" ]]; then
+                        daemon="$p/supervisord"; ctl="$p/supervisorctl"; break
+                    fi
+                done
+            fi
+            ;;
+        *) return 1;;
+    esac
+    [[ -n "$daemon" && -n "$ctl" && -n "$conf" && -f "$conf" ]] || return 1
+    _PROFILE_DAEMON="$daemon"; _PROFILE_CTL="$ctl"; _PROFILE_CONF="$conf"
+}
+
+_unit_config_from_line() {
+    local line="$1"
+    if [[ "$line" =~ [[:space:]](-c|--configuration)[[:space:]]+([^[:space:]\;\}]+) ]]; then
+        printf '%s\n' "${BASH_REMATCH[2]}"
+    elif [[ "$line" =~ [[:space:]]--configuration=([^[:space:]\;\}]+) ]]; then
+        printf '%s\n' "${BASH_REMATCH[1]}"
+    else return 1; fi
+}
+
+_unit_daemon_from_line() {
+    local line="$1"
+    if [[ "$line" =~ argv\[\]=([^[:space:]\;\}]+) ]]; then
+        printf '%s\n' "${BASH_REMATCH[1]}"
+    else return 1; fi
+}
+
+# Do not source a configuration file as shell code.
+_load_profile() {
+    local mode daemon ctl conf unit extra owner perm
+    [[ -f "$_SM_PROFILE_FILE" && ! -L "$_SM_PROFILE_FILE" ]] || return 1
+    owner=$(stat -c %u -- "$_SM_PROFILE_FILE") || return 1
+    perm=$(stat -c %a -- "$_SM_PROFILE_FILE") || return 1
+    [[ "$owner" == 0 && "$perm" == 600 ]] || return 1
+    {
+        IFS= read -r mode && IFS= read -r daemon && IFS= read -r ctl &&
+        IFS= read -r conf && IFS= read -r unit
+    } < "$_SM_PROFILE_FILE" || return 1
+    case "$mode" in auto|package|mw|manual) ;; *) return 1;; esac
+    _SM_PROFILE="$mode"
+    if [[ "$mode" == manual ]]; then
+        _SM_DAEMON="$daemon"; _SM_CTL="$ctl"; SM_MAIN_CONF="$conf"; _SM_UNIT="$unit"
+    else
+        _SM_DAEMON=""; _SM_CTL=""; _SM_UNIT=""
     fi
+}
+
+_save_profile() (
+    require_root || return 1
+    local dir tmp
+    dir=$(dirname -- "$_SM_PROFILE_FILE")
+    [[ "$dir" == /* && ! -L "$dir" ]] || return 1
+    (umask 077; mkdir -p -- "$dir") || return 1
+    [[ $(stat -c %u "$dir") == 0 && $(stat -c %a "$dir") == 700 && ! -L "$_SM_PROFILE_FILE" ]] || {
+        ui_error "Profile directory must be root-owned and mode 0700."; return 1;
+    }
+    tmp=$(mktemp "$dir/.instance.XXXXXXXX") || return 1
+    if ! printf '%s\n' "$_SM_PROFILE" "$_SM_DAEMON" "$_SM_CTL" "$SM_MAIN_CONF" "$_SM_UNIT" > "$tmp" ||
+       ! chmod 600 "$tmp" || ! mv -fT -- "$tmp" "$_SM_PROFILE_FILE"; then
+        rm -f -- "$tmp"; return 1
+    fi
+)
+
+_valid_profile() {
+    [[ "$_SM_DAEMON" == /* && "$_SM_CTL" == /* && "$SM_MAIN_CONF" == /* ]] || return 1
+    [[ -f "$_SM_DAEMON" && -x "$_SM_DAEMON" && -f "$_SM_CTL" && -x "$_SM_CTL" && -f "$SM_MAIN_CONF" ]] || return 1
+    [[ "$_SM_DAEMON" != *$'\n'* && "$_SM_CTL" != *$'\n'* && "$SM_MAIN_CONF" != *$'\n'* ]] || return 1
+    [[ -z "$_SM_UNIT" || "$_SM_UNIT" =~ ^[A-Za-z0-9_.@-]+$ ]] || return 1
+}
+
+# Match an already running daemon by its actual config and argv, not global PID count.
+_pid_matches_profile() {
+    local pid="$1" arg detected
+    [[ "$pid" =~ ^[0-9]+$ && -r "/proc/$pid/cmdline" ]] || return 1
+    detected=$(_daemon_config "$pid") || return 1
+    [[ "$detected" == /* && "$detected" -ef "$SM_MAIN_CONF" ]] || return 1
+    while IFS= read -r -d '' arg; do
+        if [[ "$arg" == /* && -f "$arg" && "$arg" -ef "$_SM_DAEMON" ]]; then return 0; fi
+    done < "/proc/$pid/cmdline"
+    return 1
+}
+
+_find_profile_pid() {
+    local proc arg pid found=""
     for proc in /proc/[0-9]*/comm; do
         { IFS= read -r arg < "$proc"; } 2>/dev/null || continue
-        [[ "$arg" == supervisord ]] || continue
-        pid="${proc#/proc/}"; pids+=("${pid%/comm}")
-    done
-    if (( ${#pids[@]} > 1 )); then _SM_CONF_AMBIGUOUS=1; return 1; fi
-    if (( ${#pids[@]} == 1 )); then
-        _SM_DAEMON_PID="${pids[0]}"
-        detected=$(_daemon_config "$_SM_DAEMON_PID") || detected=""
-        if [[ -n "$detected" ]]; then
-            if [[ "$detected" != /* || ! -f "$detected" ]]; then _SM_CONF_AMBIGUOUS=1; return 1; fi
-            SM_MAIN_CONF="$detected"; return 0
+        [[ "$arg" == supervisord || "$arg" == python* ]] || continue
+        pid="${proc#/proc/}"; pid="${pid%/comm}"
+        if _pid_matches_profile "$pid"; then
+            [[ -z "$found" ]] || return 2
+            found="$pid"
         fi
-    fi
-    if [[ -d /run/systemd/system ]]; then
-        for unit in supervisor supervisord; do
-            exec_line=$(systemctl show "$unit" -p ExecStart --value 2>/dev/null) || continue
-            if [[ "$exec_line" =~ [[:space:]](-c|--configuration)[[:space:]]+([^[:space:]\;\}]+) ]]; then
-                path="${BASH_REMATCH[2]}"
-                [[ "$path" == /* && -f "$path" ]] && candidates+=("$path")
+    done
+    [[ -n "$found" ]] || return 1
+    printf '%s\n' "$found"
+}
+
+_discover_main_conf() {
+    _SM_CONF_AMBIGUOUS=0; _SM_DAEMON_PID=""
+    local kind
+    if (( ! _SM_PROFILE_LOCKED )); then
+        if (( _SM_PROFILE_ENV )); then
+            if (( _SM_CONF_EXPLICIT )) || [[ -n "$_SM_DAEMON" || -n "$_SM_CTL" ]]; then
+                _SM_PROFILE=manual
+                [[ -n "$_SM_DAEMON" ]] || _SM_DAEMON=$(command -v supervisord || true)
+                [[ -n "$_SM_CTL" ]] || _SM_CTL=$(command -v supervisorctl || true)
+                [[ "$SM_MAIN_CONF" == /* ]] || SM_MAIN_CONF="$PWD/$SM_MAIN_CONF"
             fi
-        done
+        else
+            _load_profile || true
+        fi
+        _SM_PROFILE_LOCKED=1
     fi
-    if (( ${#candidates[@]} == 0 )); then
-        for path in /etc/supervisor/supervisord.conf /etc/supervisord.conf /usr/local/etc/supervisord.conf; do
-            [[ -f "$path" ]] && candidates+=("$path")
-        done
+    case "$_SM_PROFILE" in
+        auto|package|mw)
+            local -a order=()
+            if [[ "$_SM_PROFILE" == auto ]]; then order=(package mw); else order=("$_SM_PROFILE"); fi
+            local matched=0
+            for kind in "${order[@]}"; do
+                if _profile_paths "$kind"; then
+                    _SM_DAEMON="$_PROFILE_DAEMON"; _SM_CTL="$_PROFILE_CTL"; SM_MAIN_CONF="$_PROFILE_CONF"
+                    _SM_ACTIVE_PROFILE="$kind"; _SM_UNIT=""; matched=1; break
+                fi
+            done
+            if (( ! matched )); then
+                _SM_DAEMON=""; _SM_CTL=""; _SM_UNIT=""; _SM_ACTIVE_PROFILE=none
+                _SM_CONF_AMBIGUOUS=1; return 1
+            fi
+            ;;
+        manual) _SM_ACTIVE_PROFILE=manual;;
+        *) _SM_CONF_AMBIGUOUS=1; return 1;;
+    esac
+    _valid_profile || { _SM_CONF_AMBIGUOUS=1; return 1; }
+    local rc=0
+    _SM_DAEMON_PID=$(_find_profile_pid) || rc=$?
+    if (( rc == 2 )); then _SM_CONF_AMBIGUOUS=1; return 1; fi
+    if (( ! _SM_LOG_EXPLICIT )); then
+        if [[ "$_SM_ACTIVE_PROFILE" == mw ]]; then SM_LOG_DIR=/www/server/supervisor/log
+        elif [[ "$_SM_ACTIVE_PROFILE" == package ]]; then SM_LOG_DIR=/var/log/supervisor
+        else SM_LOG_DIR="${SM_MAIN_CONF%/*}/logs"; fi
     fi
-    if (( ${#candidates[@]} > 1 )); then
-        for path in "${candidates[@]}"; do
-            if [[ "$path" != "${candidates[0]}" && ! "$path" -ef "${candidates[0]}" ]]; then _SM_CONF_AMBIGUOUS=1; return 1; fi
-        done
-    fi
-    if (( ${#candidates[@]} )); then SM_MAIN_CONF="${candidates[0]}"; fi
-    if [[ -n "$_SM_DAEMON_PID" && ! -f "$SM_MAIN_CONF" ]]; then _SM_CONF_AMBIGUOUS=1; return 1; fi
     return 0
+}
+
+_action_profiles() {
+    local before_profile="$_SM_PROFILE" before_daemon="$_SM_DAEMON" before_ctl="$_SM_CTL"
+    local before_conf="$SM_MAIN_CONF" before_unit="$_SM_UNIT" before_active="${_SM_ACTIVE_PROFILE:-none}"
+    local choice d c f u defaultctl
+    ui_menu "Supervisor instance / 实例选择" \
+        "包管理器版本 (Package)" "MW 面板版本 (MW)" "手动输入版本 (Manual)" "自动选择 (Package > MW)" || return 0
+    choice="$_SM_MENU_CHOICE"
+    case "$choice" in
+        0) return 0;;
+        1) _SM_PROFILE=package;;
+        2) _SM_PROFILE=mw;;
+        3)
+            d=$(_ask_or_abort "supervisord absolute path / 主程序路径" "$before_daemon") || return 0
+            defaultctl="${d%/*}/supervisorctl"
+            c=$(_ask_or_abort "supervisorctl absolute path / 控制程序路径" "$defaultctl") || return 0
+            f=$(_ask_or_abort "Main config absolute path / 主配置路径" "$before_conf") || return 0
+            u=$(_ask_or_abort "Optional systemd unit (empty = auto) / 可选服务名" "") || return 0
+            _SM_PROFILE=manual; _SM_DAEMON="$d"; _SM_CTL="$c"; SM_MAIN_CONF="$f"; _SM_UNIT="$u"
+            ;;
+        4) _SM_PROFILE=auto;;
+    esac
+    _SM_PROFILE_LOCKED=1
+    if ! _discover_main_conf || ! _supervisor_python >/dev/null; then
+        ui_error "Selected instance is unavailable; keeping previous selection. / 目标不可用，保留原选择"
+        _SM_PROFILE="$before_profile"; _SM_DAEMON="$before_daemon"; _SM_CTL="$before_ctl"
+        SM_MAIN_CONF="$before_conf"; _SM_UNIT="$before_unit"; _SM_ACTIVE_PROFILE="$before_active"
+        _discover_main_conf || true; ui_pause; return 1
+    fi
+    _show_profile
+    if supervisor_alive && ! _check_daemon_identity; then
+        ui_warn "The configured socket belongs to another or unverified daemon. / socket 实例无法确认"
+    fi
+    if is_root && ui_confirm "Save selection for future sessions? / 保存为下次默认实例?" "y"; then
+        _save_profile && ui_success "Instance selection saved. / 实例选择已保存" || ui_error "Save failed; current session only. / 保存失败，仅本次生效"
+    fi
+    ui_pause
+}
+
+_show_profile() {
+    printf '  Instance: %s (%s)\n  supervisord: %s\n  supervisorctl: %s\n  Config: %s\n' \
+        "${_SM_ACTIVE_PROFILE:-none}" "$_SM_PROFILE" "${_SM_DAEMON:--}" "${_SM_CTL:--}" "$SM_MAIN_CONF"
 }
 
 _conf_ready() {
     if (( _SM_CONF_AMBIGUOUS )); then
         ui_error "配置路径不明确；请显式设置 SM_MAIN_CONF" >&2; return 1
     fi
-    [[ -f "$SM_MAIN_CONF" ]] || { ui_error "未找到主配置: $SM_MAIN_CONF" >&2; return 1; }
+    _valid_profile || { ui_error "未找到主配置或 Supervisor 程序: $SM_MAIN_CONF" >&2; return 1; }
 }
 
 _svctl() {
@@ -652,28 +839,16 @@ _svctl() {
     case "${1:-}" in
         pid|status)
             if command -v timeout >/dev/null 2>&1; then
-                timeout 5 supervisorctl -c "$SM_MAIN_CONF" "$@"; return $?
+                timeout 5 "$_SM_CTL" -c "$SM_MAIN_CONF" "$@"; return $?
             fi;;
     esac
-    command supervisorctl -c "$SM_MAIN_CONF" "$@"
+    "$_SM_CTL" -c "$SM_MAIN_CONF" "$@"
 }
 
 _check_daemon_identity() {
-    local pid comm detected
+    local pid
     pid=$(_svctl pid 2>/dev/null) || return 1
-    [[ "$pid" =~ ^[0-9]+$ && -r "/proc/$pid/comm" ]] || return 1
-    IFS= read -r comm < "/proc/$pid/comm" || return 1
-    if [[ "$comm" != supervisord ]]; then
-        tr '\0' '\n' < "/proc/$pid/cmdline" | grep -E '(^|/)supervisord$' >/dev/null || return 1
-    fi
-    [[ -z "$_SM_DAEMON_PID" || "$pid" == "$_SM_DAEMON_PID" ]] || return 1
-    detected=$(_daemon_config "$pid") || detected=""
-    if [[ -n "$detected" ]]; then
-        [[ "$detected" == /* && "$detected" -ef "$SM_MAIN_CONF" ]] || return 1
-    else
-        [[ -n "$_SM_DAEMON_PID" ]] || return 1
-    fi
-    return 0
+    _pid_matches_profile "$pid"
 }
 
 ui_menu() {
@@ -756,7 +931,7 @@ require_root() {
     return 0
 }
 
-has_supervisord() { command -v supervisord >/dev/null 2>&1; }
+has_supervisord() { [[ -n "$_SM_DAEMON" && -x "$_SM_DAEMON" ]]; }
 
 # 判断 supervisord 是否可连通（socket 是否响应）
 # 关键：不能用 supervisorctl status —— 任一进程非 RUNNING（FATAL/STOPPED/EXITED/STARTING）
@@ -764,7 +939,7 @@ has_supervisord() { command -v supervisord >/dev/null 2>&1; }
 # supervisorctl pid 才是可靠的存活探测：socket 通就返回 supervisord 的 PID 且退出 0。
 supervisor_alive() {
     has_supervisord || return 1
-    _svctl pid >/dev/null 2>&1
+    _check_daemon_identity
 }
 
 # 检测失败原因：区分"未启动"与"无权限访问 socket"
@@ -808,10 +983,13 @@ action_install() (
     require_root || return 1
     ui_title "安装 Supervisor"
     _lock_mutation || return 1
-    (( ! _SM_CONF_AMBIGUOUS )) || { ui_error "请先明确配置路径"; return 1; }
+    if [[ "$_SM_PROFILE" == manual || "$_SM_PROFILE" == mw || "${_SM_ACTIVE_PROFILE:-none}" == mw ]]; then
+        ui_warn "请先在实例菜单选择包管理器版本再安装；MW/手动版本由各自安装器维护"
+        return 1
+    fi
 
     if has_supervisord; then
-        ui_warn "已检测到 supervisord: $(supervisord --version 2>/dev/null | head -1)"
+        ui_warn "已检测到 supervisord: $("$_SM_DAEMON" --version 2>/dev/null | head -1)"
         if ! ui_confirm "是否重新安装/覆盖?" "n"; then return 0; fi
     fi
 
@@ -844,11 +1022,12 @@ action_install() (
             ;;
     esac
 
+    _discover_main_conf || true
     if ! has_supervisord; then
         ui_error "安装命令执行完毕但 supervisord 不可用，请检查输出"
         ui_pause; return 1
     fi
-    ui_success "supervisor 已安装: $(supervisord --version 2>/dev/null | head -1)"
+    ui_success "supervisor 已安装: $("$_SM_DAEMON" --version 2>/dev/null | head -1)"
 
     _discover_main_conf || { ui_error "无法唯一识别安装后的主配置"; return 1; }
     mkdir -p "$SM_CONF_DIR" "$SM_LOG_DIR" "$SM_RUN_DIR" "$(dirname "$SM_MAIN_CONF")" || return 1
@@ -902,144 +1081,41 @@ EOF
 #  模块: 开机自启
 # ============================================================================
 
+
 action_boot() (
-    require_root || return 1
-    ui_title "配置开机自启"
     _lock_mutation || return 1
     _conf_ready || return 1
-
-    if ! has_supervisord; then
-        ui_error "尚未安装 supervisor，请先执行菜单 [1]"
-        ui_pause; return 1
+    ui_title "配置开机自启"
+    local svc cur_state=disabled cur_active=inactive
+    if [[ $(detect_init) != systemd ]]; then
+        ui_error "Cannot safely identify a matching init service; configure it manually."
+        return 1
     fi
-
-    local init; init=$(detect_init)
-    if supervisor_alive; then _check_daemon_identity || { ui_error "无法验证本机 Supervisor 实例"; return 1; }; fi
-    case "$init" in
-        systemd)
-            # 用 systemctl cat 探测真实 unit 名，覆盖 /lib、/usr/lib、/etc 各发行版差异
-            local svc_name=""
-            local cand
-            for cand in supervisor supervisord; do
-                if systemctl cat "$cand" >/dev/null 2>&1; then
-                    if [[ -n "$svc_name" ]] && [[ $(systemctl show "$svc_name" -p Id --value) != $(systemctl show "$cand" -p Id --value) ]]; then ui_error "多个 Supervisor unit，请手动处理"; return 1; fi
-                    svc_name="$cand"
-                fi
-            done
-
-            if [[ -z "$svc_name" ]]; then
-                local sup_bin ctl_bin
-                sup_bin=$(command -v supervisord)
-                ctl_bin=$(command -v supervisorctl)
-                if [[ -z "$sup_bin" || -z "$ctl_bin" ]]; then
-                    ui_error "无法定位 supervisord/supervisorctl 可执行文件路径，无法生成 unit"
-                    ui_pause; return 1
-                fi
-                _native_conf validate "$SM_MAIN_CONF" || return 1
-                [[ "$SM_MAIN_CONF" != *[[:space:]%]* && "$sup_bin" != *[[:space:]%]* && "$ctl_bin" != *[[:space:]%]* ]] || { ui_error "路径含空白或 %，请手动创建 unit"; return 1; }
-                ui_confirm "未找到原生 unit，是否创建 supervisor.service?" "n" || return 0
-                cat > /etc/systemd/system/supervisor.service <<EOF
-[Unit]
-Description=Process Monitoring and Control Daemon (Supervisor)
-After=network.target
-
-[Service]
-Type=simple
-ExecStart=$sup_bin -n -c $SM_MAIN_CONF
-ExecStop=$ctl_bin -c $SM_MAIN_CONF shutdown
-RuntimeDirectory=supervisor
-KillMode=control-group
-TimeoutStopSec=120
-Restart=on-failure
-RestartSec=3
-
-[Install]
-WantedBy=multi-user.target
-EOF
-                systemctl daemon-reload || return 1
-                svc_name=supervisor
-            fi
-
-            _unit_matches_conf "$svc_name" || return 1
-            local cur_state=disabled cur_active=inactive
-            systemctl is-enabled "$svc_name" >/dev/null 2>&1 && cur_state=enabled
-            systemctl is-active "$svc_name"  >/dev/null 2>&1 && cur_active=active
-
-            echo "  服务名:       $svc_name"
-            echo "  开机自启:     $cur_state"
-            echo "  运行状态:     $cur_active"
-            echo
-
-            if [[ "$cur_state" == "enabled" && "$cur_active" == "active" ]]; then
-                ui_success "已开启开机自启且正在运行"
-                if ui_confirm "是否禁用开机自启并停止?" "n"; then
-                    systemctl disable --now "$svc_name" \
-                        && ui_warn "已禁用并停止" \
-                        || ui_error "禁用失败，请检查 systemctl 输出"
-                fi
-            else
-                if ui_confirm "是否启用开机自启并立即启动?"; then
-                    if ! systemctl enable --now "$svc_name"; then
-                        ui_error "systemctl enable 失败"
-                        ui_info "手动排查: systemctl status $svc_name"
-                        ui_pause; return 1
-                    fi
-                    # 服务启动是异步的，轮询等待而不是立刻判定失败
-                    local waited=0
-                    while (( waited < 50 )); do
-                        if systemctl is-active "$svc_name" >/dev/null 2>&1; then
-                            break
-                        fi
-                        # 若已进入 failed 状态则提前退出
-                        if systemctl is-failed "$svc_name" >/dev/null 2>&1; then
-                            break
-                        fi
-                        sleep 0.2
-                        ((waited++))
-                    done
-
-                    if systemctl is-active "$svc_name" >/dev/null 2>&1; then
-                        ui_success "已启用并运行"
-                        if supervisor_alive; then
-                            ui_info "supervisorctl 连通性检查: 正常"
-                        else
-                            ui_warn "服务已启动但 supervisorctl 无法连通"
-                            _report_not_alive
-                        fi
-                    else
-                        ui_error "已 enable 但启动失败"
-                        ui_info "排查命令:"
-                        echo "    systemctl status $svc_name --no-pager -l"
-                        echo "    journalctl -u $svc_name -n 50 --no-pager"
-                        echo "    supervisord -n -c $SM_MAIN_CONF   # 前台试跑看报错"
-                    fi
-                fi
-            fi
-            ;;
-        openrc)
-            ui_info "检测到 OpenRC"
-            rc-update add supervisor default 2>/dev/null || rc-update add supervisord default 2>/dev/null || {
-                ui_error "OpenRC 添加开机自启失败，请手动执行 rc-update add supervisor default"
-                ui_pause; return 1
-            }
-            ui_success "已加入 default 运行级"
-            if ui_confirm "是否立即启动 Supervisor?"; then
-                if [[ -x /etc/init.d/supervisor ]]; then rc-service supervisor start || return 1
-                else rc-service supervisord start || return 1; fi
-                supervisor_alive || { _report_not_alive; return 1; }
-            fi
-            ;;
-        *)
-            ui_error "无法识别 init 系统，建议手动写 /etc/rc.local 或 cron @reboot"
-            ui_pause; return 1
-            ;;
-    esac
+    svc=$(_matching_unit) || {
+        ui_error "No unique matching systemd unit. Set the unit name in the instance menu or configure it manually."
+        return 1
+    }
+    systemctl is-enabled "$svc" >/dev/null 2>&1 && cur_state=enabled
+    systemctl is-active "$svc" >/dev/null 2>&1 && cur_active=active
+    printf '  Service: %s\n  Boot: %s\n  State: %s\n' "$svc" "$cur_state" "$cur_active"
+    if [[ "$cur_state" == enabled && "$cur_active" == active ]]; then
+        ui_confirm "Disable and stop selected instance? / 禁用并停止当前实例?" "n" || return 0
+        supervisor_alive || { ui_error "Selected daemon identity cannot be verified."; return 1; }
+        systemctl disable --now "$svc" || return 1
+    else
+        ui_confirm "Enable and start selected instance? / 启用并启动当前实例?" "n" || return 0
+        _native_conf validate "$SM_MAIN_CONF" || return 1
+        if _svctl pid >/dev/null 2>&1 && ! supervisor_alive; then ui_error "Socket belongs to another daemon."; return 1; fi
+        systemctl enable --now "$svc" || return 1
+        local waited=0
+        while (( waited < 20 )); do
+            if supervisor_alive; then ui_success "Selected instance is running."; ui_pause; return 0; fi
+            sleep 0.5; ((waited++))
+        done
+        ui_error "Service started but selected instance did not respond."; return 1
+    fi
     ui_pause
 )
-
-# ============================================================================
-#  模块: 状态
-# ============================================================================
 
 _list_proc_names() {
     if ! supervisor_alive; then return 0; fi
@@ -1062,7 +1138,7 @@ _supervisor_status_raw() {
 # 返回 0=正常, 1=supervisord 不可用, 2=无受管进程
 _render_status_table() {
     if ! has_supervisord; then
-        echo -e "  ${C_YELLOW}supervisord 未安装${C_RESET}  → 请选择 [1] 安装"
+        echo -e "  ${C_YELLOW}未找到可用实例${C_RESET}  → 请选择 [1] 安装或 [12] 选择实例"
         return 1
     fi
     if ! supervisor_alive; then
@@ -1270,7 +1346,7 @@ _tx_begin() {
             printf '%s\n' "$pending"; return 1;
         }
         _TX_ONLINE=1
-    elif [[ -n "$_SM_DAEMON_PID" ]] || pgrep -x supervisord >/dev/null 2>&1; then
+    elif [[ -n "$_SM_DAEMON_PID" ]] || _svctl pid >/dev/null 2>&1; then
         ui_error "发现运行中的 Supervisor 但无法确认连接，拒绝写入"; return 1
     fi
     if [[ -f "$_TX_TARGET" ]]; then
@@ -1354,46 +1430,48 @@ _tx_apply() {
     _TX_DIRTY=0
 }
 
-_unit_matches_conf() {
-    local line path
-    line=$(systemctl show "$1" -p ExecStart --value 2>/dev/null) || return 1
-    if [[ "$line" =~ [[:space:]](-c|--configuration)[[:space:]]+([^[:space:]\;\}]+) ]]; then
-        path="${BASH_REMATCH[2]}"
-        [[ "$path" == /* && "$path" -ef "$SM_MAIN_CONF" ]] && return 0
+_matching_unit() {
+    local name line config daemon id
+    local -a units=() matches=()
+    if [[ -n "$_SM_UNIT" ]]; then units=("$_SM_UNIT")
+    else
+        while IFS= read -r name; do [[ -n "$name" ]] && units+=("$name"); done < <(
+            systemctl list-unit-files --type=service --no-legend --no-pager 2>/dev/null |
+                awk '$1 ~ /supervisor/ {print $1}'
+        )
+        units+=(supervisor.service supervisord.service)
     fi
-    ui_error "无法确认 unit $1 使用当前配置，请手动操作"
-    return 1
+    for name in "${units[@]}"; do
+        line=$(systemctl show "$name" -p ExecStart --value 2>/dev/null) || continue
+        config=$(_unit_config_from_line "$line") || continue
+        daemon=$(_unit_daemon_from_line "$line") || continue
+        [[ "$config" -ef "$SM_MAIN_CONF" && "$daemon" -ef "$_SM_DAEMON" ]] || continue
+        id=$(systemctl show "$name" -p Id --value 2>/dev/null) || continue
+        [[ -n "$id" ]] || continue
+        local old seen=0
+        for old in "${matches[@]}"; do [[ "$old" == "$id" ]] && seen=1; done
+        (( seen )) || matches+=("$id")
+    done
+    (( ${#matches[@]} == 1 )) || return 1
+    printf '%s\n' "${matches[0]}"
+}
+
+_unit_matches_conf() {
+    local name
+    name=$(_matching_unit) || return 1
+    [[ "$name" == "$1" || "$name" == "$1.service" ]]
 }
 
 _restart_supervisor() {
-    local init svc="" cand waited=0
-    init=$(detect_init)
-    case "$init" in
-        systemd)
-            for cand in supervisor supervisord; do
-                if systemctl cat "$cand" >/dev/null 2>&1; then
-                    if [[ -n "$svc" ]] && [[ $(systemctl show "$svc" -p Id --value) != $(systemctl show "$cand" -p Id --value) ]]; then
-                        ui_error "存在多个 Supervisor unit，请手动重启"; return 1
-                    fi
-                    svc="$cand"
-                fi
-            done
-            [[ -n "$svc" ]] || return 1
-            _unit_matches_conf "$svc" || return 1
-            systemctl restart "$svc" || return 1;;
-        openrc)
-            for cand in supervisor supervisord; do
-                [[ -x "/etc/init.d/$cand" ]] || continue
-                [[ -z "$svc" ]] || return 1
-                svc="$cand"
-            done
-            [[ -n "$svc" ]] || return 1
-            rc-service "$svc" restart || return 1;;
-        *) ui_error "未知 init，请手动重启"; return 1;;
-    esac
-    _SM_DAEMON_PID=""
+    local svc waited=0
+    if [[ $(detect_init) != systemd ]]; then
+        ui_error "Cannot identify an instance-specific service; restart manually."
+        return 1
+    fi
+    svc=$(_matching_unit) || { ui_error "No unique matching systemd service; restart manually."; return 1; }
+    systemctl restart "$svc" || return 1
     while (( waited < 20 )); do
-        if supervisor_alive && _check_daemon_identity; then return 0; fi
+        supervisor_alive && return 0
         sleep 0.5; ((waited++))
     done
     return 1
@@ -1820,6 +1898,7 @@ main_menu() {
             _SM_LOCALE_NOTE=""
         fi
         ui_title "Supervisor Manager v$SM_VERSION"
+        _show_profile
         _render_status_table
 
         if ! ui_menu --bare --zero "退出" "" \
@@ -1833,7 +1912,8 @@ main_menu() {
             "编辑进程配置" \
             "重载 supervisor 配置 (reread+update)" \
             "删除守护进程" \
-            "编辑主 supervisord.conf"; then
+            "编辑主 supervisord.conf" \
+            "Supervisor 实例选择"; then
             # EOF（Ctrl-D / 管道结束）
             echo "再见"; exit 0
         fi
@@ -1850,6 +1930,7 @@ main_menu() {
             9)  action_reload ;;
             10) action_delete ;;
             11) action_edit_main ;;
+            12) _action_profiles ;;
             0)  echo "再见"; exit 0 ;;
         esac
     done
@@ -2009,25 +2090,16 @@ EOF
     echo
     ui_info "── 环境检查 ──"
     if has_supervisord; then
-        ui_info "supervisord 已安装: $(supervisord --version 2>/dev/null | head -1)"
+        ui_info "supervisord 已安装: $("$_SM_DAEMON" --version 2>/dev/null | head -1)"
         if supervisor_alive; then
             ui_info "supervisord 运行中"
         else
             ui_warn "supervisord 未运行，运行 '$final_name' 进菜单 [2] 启动"
         fi
-        # systemd 开机自启检查（不适用于非 systemd 环境）
-        if [[ -d /run/systemd/system ]]; then
-            local svc
-            for svc in supervisor supervisord; do
-                if systemctl cat "$svc" >/dev/null 2>&1; then
-                    if systemctl is-enabled "$svc" >/dev/null 2>&1; then
-                        ui_info "开机自启 ($svc): 已启用"
-                    else
-                        ui_warn "开机自启 ($svc): 未启用，运行 '$final_name' 进菜单 [2] 配置"
-                    fi
-                    break
-                fi
-            done
+        local svc
+        if svc=$(_matching_unit 2>/dev/null); then
+            printf '  Service: %s\n' "$svc"
+            systemctl is-enabled "$svc" 2>/dev/null || true
         fi
     else
         ui_warn "supervisord 未安装，运行 '$final_name' 进菜单 [1] 安装"
@@ -2106,6 +2178,8 @@ _fit_width
 # source 模式（SM_NO_ENTRY=1）跳过——改调用方的全局环境不是被加载者该做的事
 if [[ "${SM_NO_ENTRY:-0}" != "1" ]]; then
     _ensure_utf8_locale
+    _discover_main_conf || true
+elif (( _SM_PROFILE_ENV )); then
     _discover_main_conf || true
 fi
 
