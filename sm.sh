@@ -361,7 +361,7 @@ ui_ask() {
     fi
     read -r -p "$(echo -e "$p")" input || return 1
     if [[ -z "$input" && -n "$default" ]]; then echo "$default"
-    else echo "$input"; fi
+    else printf '%s\n' "$input"; fi
 }
 
 # ui_confirm "提示" [y|n] -> 0=是 1=否
@@ -714,6 +714,7 @@ ui_menu() {
             continue
         fi
         # 强制十进制，避免 "08" 被 (( )) / [[ -eq ]] 当作非法八进制
+        if (( ${#choice} > 9 )); then ui_error "数字过大"; continue; fi
         choice=$((10#$choice))
         if (( choice < 0 || choice > ${#options[@]} )); then
             ui_error "超出范围 [0-${#options[@]}]"
@@ -1043,7 +1044,7 @@ _list_proc_names() {
     if ! supervisor_alive; then return 0; fi
     # 原样列出第一列：包括 numprocs 实例（name:0/name:1）与组汇总（group:*）
     # supervisorctl 原生支持这些语法，无需也不能过滤
-    _svctl status 2>/dev/null | awk 'NF {print $1}'
+    _svctl status 2>/dev/null | awk '$2 ~ /^(STOPPED|STARTING|RUNNING|BACKOFF|STOPPING|EXITED|FATAL|UNKNOWN)$/ {print $1}'
 }
 
 # 读取状态原始输出（首页每轮菜单都会调用）
@@ -1189,7 +1190,201 @@ action_status() {
 #  模块: 添加守护进程
 # ============================================================================
 
-action_add() {
+
+# Private backup storage and an advisory lock for cooperating SVM sessions.
+_private_dir() {
+    local dir="$SM_BACKUP_DIR" mode
+    [[ "$dir" == /* && ! -L "$dir" ]] || return 1
+    (umask 077; mkdir -p -- "$dir") || return 1
+    [[ -d "$dir" && ! -L "$dir" && $(stat -c %u -- "$dir") == "$EUID" ]] || return 1
+    mode=$(stat -c %a -- "$dir") || return 1
+    if [[ "$dir" == /var/backups/supervisor-manager && "$mode" == 755 ]]; then
+        chmod 0700 -- "$dir" || return 1
+        mode=700
+    fi
+    [[ "$mode" == 700 ]] || { ui_error "备份目录权限必须为 0700: $dir" >&2; return 1; }
+}
+
+_lock_mutation() {
+    require_root || return 1
+    _private_dir || { ui_error "无法建立安全备份目录，取消操作"; return 1; }
+    command -v flock >/dev/null 2>&1 || { ui_error "缺少 flock（util-linux）"; return 1; }
+    [[ ! -L "$SM_BACKUP_DIR/.lock" ]] || return 1
+    exec 9>>"$SM_BACKUP_DIR/.lock" || return 1
+    flock -n 9 || { ui_error "另一 SVM 会话正在修改配置"; return 1; }
+}
+
+_safe_target() {
+    local file="$1" dir owner mode
+    [[ "$file" == /* && ! -L "$file" && ! -d "$file" ]] || return 1
+    dir=$(dirname -- "$file")
+    [[ -d "$dir" ]] || return 1
+    owner=$(stat -Lc %u -- "$dir") || return 1
+    mode=$(stat -Lc %a -- "$dir") || return 1
+    [[ "$owner" == "$EUID" && "$mode" =~ ^[0-7]{3,4}$ ]] || return 1
+    (( (8#$mode & 0022) == 0 )) || return 1
+    if [[ -e "$file" ]]; then
+        [[ -f "$file" && $(stat -c %u -- "$file") == "$EUID" ]] || return 1
+    fi
+}
+
+_atomic_publish() {
+    local src="$1" dst="$2" tmp mode=0600
+    _safe_target "$dst" || { ui_error "拒绝不安全的写入目标: $dst"; return 1; }
+    tmp=$(mktemp "$(dirname -- "$dst")/.svm.XXXXXXXX") || return 1
+    if [[ -f "$dst" ]]; then mode=$(stat -c %a -- "$dst") || { rm -f -- "$tmp"; return 1; }; fi
+    if ! cat -- "$src" > "$tmp" || ! chmod "$mode" "$tmp" || ! mv -fT -- "$tmp" "$dst"; then
+        rm -f -- "$tmp"; return 1
+    fi
+}
+
+_reread_groups() {
+    local out line
+    out=$(_svctl reread 2>&1) || { printf '%s\n' "$out" >&2; return 1; }
+    while IFS= read -r line; do
+        [[ -z "$line" || "$line" == "No config updates to processes" ]] && continue
+        if [[ "$line" =~ ^([^[:space:]:]+):[[:space:]](available|changed|disappeared)$ ]]; then
+            [[ "${BASH_REMATCH[1]}" != all && "${BASH_REMATCH[1]}" != -* ]] || return 1
+            printf '%s\n' "${BASH_REMATCH[1]}"
+        else
+            printf '无法识别 reread 输出: %s\n' "$line" >&2; return 1
+        fi
+    done <<< "$out"
+}
+
+_tx_begin() {
+    _conf_ready || return 1
+    _lock_mutation || return 1
+    _TX_TARGET="$1"; _TX_BACKUP=""; _TX_STAGE=""; _TX_DIRTY=0
+    _TX_ONLINE=0; _TX_APPLY=0; _TX_MAIN_RESTART=0; _TX_GROUPS=""; _TX_MODE=0600
+    _safe_target "$_TX_TARGET" || { ui_error "不安全的目标: $_TX_TARGET"; return 1; }
+    _native_conf validate "$SM_MAIN_CONF" || { ui_error "现有配置无效，请先手动恢复"; return 1; }
+    if supervisor_alive; then
+        _check_daemon_identity || { ui_error "无法验证本机 Supervisor 实例"; return 1; }
+        local pending
+        pending=$(_reread_groups) || return 1
+        [[ -z "$pending" ]] || {
+            ui_error "已有未应用的配置修改，请先使用菜单 [9] 或手工处理"
+            printf '%s\n' "$pending"; return 1;
+        }
+        _TX_ONLINE=1
+    elif [[ -n "$_SM_DAEMON_PID" ]] || pgrep -x supervisord >/dev/null 2>&1; then
+        ui_error "发现运行中的 Supervisor 但无法确认连接，拒绝写入"; return 1
+    fi
+    if [[ -f "$_TX_TARGET" ]]; then
+        _TX_MODE=$(stat -c %a -- "$_TX_TARGET") || return 1
+        _TX_BACKUP=$(_backup_file "$_TX_TARGET") || { ui_error "备份失败，取消修改"; return 1; }
+        ui_info "已备份: $_TX_BACKUP"
+    fi
+    _TX_STAGE=$(mktemp "$SM_BACKUP_DIR/.stage.XXXXXXXX") || return 1
+    trap '_tx_cleanup' EXIT
+    trap 'exit 130' INT
+    trap 'exit 143' TERM
+    if [[ -n "$_TX_BACKUP" ]]; then cat -- "$_TX_BACKUP" > "$_TX_STAGE" || return 1; fi
+}
+
+_tx_cleanup() {
+    local rc=$?
+    trap - EXIT
+    trap '' INT TERM
+    if (( _TX_DIRTY )); then
+        ui_warn "操作未提交，恢复磁盘配置"
+        local restored=1
+        if [[ -n "$_TX_BACKUP" ]]; then
+            if _atomic_publish "$_TX_BACKUP" "$_TX_TARGET"; then chmod "$_TX_MODE" -- "$_TX_TARGET" || restored=0; else restored=0; fi
+        else
+            rm -f -- "$_TX_TARGET" || restored=0
+        fi
+        if (( ! restored )); then
+            ui_error "自动恢复失败！目标: $_TX_TARGET；备份: $_TX_BACKUP"
+        elif (( _TX_ONLINE )); then
+            if (( _TX_MAIN_RESTART )); then
+                _restart_supervisor || ui_error "磁盘已恢复，但服务重启失败，请人工检查"
+            else
+                local groups g
+                groups=$(_reread_groups) || { ui_error "磁盘已恢复，但 reread 失败"; groups=""; }
+                if (( _TX_APPLY )) && [[ -n "$groups" ]]; then
+                    while IFS= read -r g; do
+                        [[ -n "$g" ]] || continue
+                        if grep -Fxq -- "$g" <<< "$_TX_GROUPS"; then
+                            _svctl update "$g" || ui_error "组 $g 运行态恢复失败"
+                        else
+                            ui_warn "未自动应用无关组 $g"
+                        fi
+                    done <<< "$groups"
+                    ui_warn "运行态恢复为尽力而为；请复核原手动启停状态"
+                fi
+            fi
+        fi
+        (( rc == 0 )) && rc=1
+    fi
+    [[ -z "$_TX_STAGE" ]] || rm -f -- "$_TX_STAGE"
+    exit "$rc"
+}
+
+_tx_publish() {
+    if [[ -n "$_TX_BACKUP" ]]; then
+        cmp -s -- "$_TX_TARGET" "$_TX_BACKUP" || { ui_error "配置已被外部修改"; return 1; }
+    else
+        [[ ! -e "$_TX_TARGET" && ! -L "$_TX_TARGET" ]] || { ui_error "目标已存在"; return 1; }
+    fi
+    _TX_DIRTY=1
+    _atomic_publish "$_TX_STAGE" "$_TX_TARGET"
+}
+
+_tx_apply() {
+    _native_conf validate "$SM_MAIN_CONF" || return 1
+    if (( _TX_ONLINE )); then
+        _TX_GROUPS=$(_reread_groups) || return 1
+        if [[ -n "$_TX_GROUPS" ]]; then
+            local -a groups=()
+            local g remaining
+            while IFS= read -r g; do [[ -n "$g" ]] && groups+=("$g"); done <<< "$_TX_GROUPS"
+            ui_info "仅应用变更组: ${groups[*]}"
+            _TX_APPLY=1
+            _svctl update "${groups[@]}" || return 1
+            remaining=$(_reread_groups) || return 1
+            [[ -z "$remaining" ]] || { ui_error "仍有未应用的配置变更"; return 1; }
+        fi
+    else
+        ui_info "配置已通过离线解析；下次启动时生效"
+    fi
+    _TX_DIRTY=0
+}
+
+_restart_supervisor() {
+    local init svc="" cand waited=0
+    init=$(detect_init)
+    case "$init" in
+        systemd)
+            for cand in supervisor supervisord; do
+                if systemctl cat "$cand" >/dev/null 2>&1; then
+                    if [[ -n "$svc" ]] && [[ $(systemctl show "$svc" -p Id --value) != $(systemctl show "$cand" -p Id --value) ]]; then
+                        ui_error "存在多个 Supervisor unit，请手动重启"; return 1
+                    fi
+                    svc="$cand"
+                fi
+            done
+            [[ -n "$svc" ]] || return 1
+            systemctl restart "$svc" || return 1;;
+        openrc)
+            for cand in supervisor supervisord; do
+                [[ -x "/etc/init.d/$cand" ]] || continue
+                [[ -z "$svc" ]] || return 1
+                svc="$cand"
+            done
+            [[ -n "$svc" ]] || return 1
+            rc-service "$svc" restart || return 1;;
+        *) ui_error "未知 init，请手动重启"; return 1;;
+    esac
+    while (( waited < 20 )); do
+        supervisor_alive && return 0
+        sleep 0.5; ((waited++))
+    done
+    return 1
+}
+
+action_add() (
     require_root || return 1
     ui_title "添加守护进程"
 
@@ -1211,7 +1406,7 @@ action_add() {
         ui_pause; return 1
     fi
     # 进程名会成为 [program:x] 段名，必须符合 supervisor 命名规则
-    if ! [[ "$name" =~ ^[A-Za-z0-9_.-]+$ ]]; then
+    if ! [[ "$name" =~ ^[A-Za-z0-9_][A-Za-z0-9_.-]*$ ]] || [[ "$name" == all ]]; then
         ui_error "名称只能包含字母、数字、下划线、点、连字符（不含空格/斜杠/冒号）"
         ui_info "示例: myapp / web_api / worker-01"
         ui_pause; return 1
@@ -1233,7 +1428,7 @@ action_add() {
     user=$(_ask_or_abort "运行用户" "root") || { ui_pause; return 0; }
     directory=$(_ask_or_abort "工作目录" "/") || { ui_pause; return 0; }
     autostart=$(_ask_or_abort "随supervisor启动(y/n)" "y") || { ui_pause; return 0; }
-    autorestart=$(_ask_or_abort "崩溃自动重启(y/n)" "y") || { ui_pause; return 0; }
+    autorestart=$(_ask_or_abort "自动重启(true/unexpected/false)" "true") || { ui_pause; return 0; }
     priority=$(_ask_or_abort "启动优先级(数字越小越早)" "999") || { ui_pause; return 0; }
     stdout_log=$(_ask_or_abort "stdout日志路径" "$SM_LOG_DIR/$name.log") || { ui_pause; return 0; }
     stderr_log=$(_ask_or_abort "stderr日志路径" "$SM_LOG_DIR/$name-error.log") || { ui_pause; return 0; }
@@ -1258,7 +1453,9 @@ action_add() {
     fi
 
     autostart=$(_to_bool "$autostart")
-    autorestart=$(_to_bool "$autorestart")
+    case "$autorestart" in true|y|yes) autorestart=true;; unexpected) ;; false|n|no) autorestart=false;; *) ui_error "无效重启策略"; return 1;; esac
+    id "$user" >/dev/null 2>&1 || { ui_error "运行用户不存在"; return 1; }
+    [[ -d "$directory" && "$directory" == /* ]] || { ui_error "工作目录必须为存在的绝对路径"; return 1; }
 
     ui_title "预览配置"
     echo "[program:$name]"
@@ -1270,81 +1467,42 @@ action_add() {
     echo "priority=$priority"
     echo "stdout_logfile=$stdout_log"
     echo "stderr_logfile=$stderr_log"
-    [[ -n "$env_str" ]] && echo "environment=$env_str"
+    [[ -n "$env_str" ]] && echo "environment=（已隐藏）"
     echo
 
     if ! ui_confirm "确认写入并加载?"; then
         ui_warn "已取消"; ui_pause; return 0
     fi
 
-    mkdir -p "$(dirname "$stdout_log")" "$(dirname "$stderr_log")" "$conf_dir" 2>/dev/null || true
-
-    if ! {
-        echo "[program:$name]"
-        echo "command=$command"
-        echo "directory=$directory"
-        echo "user=$user"
-        echo "autostart=$autostart"
-        echo "autorestart=$autorestart"
-        echo "priority=$priority"
-        echo "stdout_logfile=$stdout_log"
-        echo "stderr_logfile=$stderr_log"
-        echo "stdout_logfile_maxbytes=8MB"
-        echo "stdout_logfile_backups=3"
-        echo "stderr_logfile_maxbytes=8MB"
-        echo "stderr_logfile_backups=3"
-        # 注意：必须用 if 语句，不能写 `[[ -n "$x" ]] && echo ...`
-        # 否则 env 为空时该判断返回 1，整个 { } 重定向组被判为“写入失败”（文件其实已写成功）
-        if [[ -n "$env_str" ]]; then
-            echo "environment=$env_str"
+    _tx_begin "$target" || return 1
+    [[ -z "$_TX_BACKUP" ]] || { ui_error "目标已存在"; return 1; }
+    name_rc=0; _program_exists "$name" || name_rc=$?
+    (( name_rc == 1 )) || return 1
+    mkdir -p -- "$(dirname -- "$stdout_log")" "$(dirname -- "$stderr_log")" || return 1
+    {
+        printf '%s\n' "[program:$name]" "command=$command" "directory=$directory" "user=$user"
+        printf '%s\n' "autostart=$autostart" "autorestart=$autorestart" "priority=$priority"
+        printf '%s\n' "stdout_logfile=$stdout_log" "stderr_logfile=$stderr_log"
+        printf '%s\n' 'stdout_logfile_maxbytes=8MB' 'stdout_logfile_backups=3'
+        printf '%s\n' 'stderr_logfile_maxbytes=8MB' 'stderr_logfile_backups=3'
+        printf '%s\n' 'stopasgroup=true' 'killasgroup=true'
+        if [[ -n "$env_str" ]]; then printf '%s\n' "environment=$env_str"; fi
+    } > "$_TX_STAGE" || return 1
+    _tx_publish || return 1
+    local files
+    files=$(_conf_source_files) || return 1
+    grep -Fxq -- "$target" <<< "$files" || { ui_error "新文件未被 include 匹配"; return 1; }
+    _tx_apply || return 1
+    ui_success "配置添加完成: $target"
+    if (( _TX_ONLINE )); then
+        if [[ "$autostart" == false ]] && ui_confirm "是否立即启动?" "n"; then
+            _svctl start "$name" || { ui_error "配置已加载，但启动失败"; return 1; }
         fi
-    } > "$target" 2>/dev/null; then
-        ui_error "配置写入失败: $target"
-        ui_info "检查目录是否存在且有写权限: ls -ld $conf_dir"
-        ui_pause; return 1
-    fi
-
-    ui_info "已写入: $target"
-    # 落点自检：写对了目录但后缀不匹配 include 时，文件不会被加载
-    if ! _conf_source_files 2>/dev/null | grep -Fxq "$target"; then
-        ui_warn "该文件不在 supervisord 的 include 匹配范围内，可能不会被加载"
-        ui_info "当前 [include] files: $(_conf_include_patterns "$SM_MAIN_CONF" 2>/dev/null | tr '\n' ' ')"
-    fi
-
-    if supervisor_alive; then
-        ui_info "执行 reread + update ..."
-        local reread_out update_out
-        reread_out=$(_svctl reread 2>&1) || true
-        [[ -n "$reread_out" ]] && echo "$reread_out"
-        if [[ "$reread_out" == *"ERROR"* ]]; then
-            ui_error "reread 失败，配置可能有语法错误"
-            ui_info "查看完整错误: supervisorctl reread"
-            ui_info "配置文件: $target"
-            ui_pause; return 1
-        fi
-
-        update_out=$(_svctl update 2>&1) || true
-        [[ -n "$update_out" ]] && echo "$update_out"
-        if [[ "$update_out" == *"ERROR"* ]]; then
-            ui_error "update 失败"
-            ui_pause; return 1
-        fi
-
-        # update 对 autostart=true 的进程会自动拉起，再 start 会报 already started
-        if [[ "$autostart" == "true" ]]; then
-            ui_info "autostart=true，update 已自动启动该进程"
-        else
-            if ui_confirm "autostart=false，是否立即启动该进程?"; then
-                _svctl start "$name" || true
-            fi
-        fi
-        ui_success "添加完成。当前状态："
-        _svctl status "$name" 2>/dev/null || true
-    else
-        ui_warn "supervisord 未运行，启动后新进程会按 autostart 自动拉起"
+        _svctl status "$name" || ui_warn "配置已加载，进程未处于 RUNNING，请查看日志"
     fi
     ui_pause
-}
+
+)
 
 # ============================================================================
 #  模块: 启停重启
@@ -1388,6 +1546,8 @@ _action_ctl() {
     fi
     _promote_target "$op" || { ui_pause; return 0; }
     local target="$_SM_TARGET"
+    _check_daemon_identity || { ui_error "无法验证本机 Supervisor 实例"; return 1; }
+    if [[ "$target" == all && "$cmd" != start ]]; then ui_confirm "确认${op}全部进程?" "n" || return 0; fi
     [[ -n "$target" ]] || { ui_warn "未选择目标"; ui_pause; return 0; }
     ui_info "执行 supervisorctl $cmd $target ..."
     if _svctl "$cmd" "$target"; then
@@ -1422,8 +1582,8 @@ action_log() {
         "查看 stderr 末尾 (tail)"
         "实时跟随 stdout (tail -f)"
         "实时跟随 stderr (tail -f)"
-        "用 \$EDITOR 打开 stdout_logfile"
-        "用 \$EDITOR 打开 stderr_logfile"
+        "只读查看 stdout_logfile"
+        "只读查看 stderr_logfile"
     )
     if ! ui_menu "选择日志动作 [$name]" "${actions[@]}"; then ui_pause; return 0; fi
     local act="$_SM_MENU_CHOICE"
@@ -1440,30 +1600,10 @@ action_log() {
             local file
             file=$(_lookup_key "$name" "$key")
 
-            if [[ -z "$file" ]]; then
-                ui_error "配置中未找到 $key（进程: $name）"
-                ui_info "该进程可能使用 supervisor 默认日志（AUTO 模式）"
-                local childdir
-                childdir=$(_lookup_key "$name" "childlogdir")
-                [[ -z "$childdir" ]] && childdir=$(awk -F'=' '$1=="childlogdir" {sub(/^[^=]*=/, ""); print; exit}' "$SM_MAIN_CONF" 2>/dev/null)
-                childdir="${childdir:-/var/log/supervisor}"
-                ui_info "可查看目录: $childdir/"
-                ui_info "或用菜单 [7] 的 tail 动作直接读运行中进程日志"
-            elif [[ "$file" == "AUTO" || "$file" == "auto" ]]; then
-                ui_warn "$key=AUTO，日志由 supervisor 自动管理"
-                local childdir
-                childdir=$(awk -F'=' '$1=="childlogdir" {sub(/^[^=]*=/, ""); print; exit}' "$SM_MAIN_CONF" 2>/dev/null)
-                childdir="${childdir:-/var/log/supervisor}"
-                ui_info "实际文件在 childlogdir 下: $childdir/"
-                ui_info "建议改用菜单 [7] 的 tail 动作，或把 $key 改为显式路径"
-            elif [[ ! -f "$file" ]]; then
-                ui_warn "$key 指向的文件尚不存在: $file"
-                ui_info "进程可能还没产生输出，或路径写错"
-                if ui_confirm "仍要打开编辑器查看/创建该文件?" "n"; then
-                    _open_editor "$file"
-                fi
+            if [[ -z "$file" || "$file" != /* || ! -f "$file" ]]; then
+                ui_warn "实际日志不存在或不可用，建议使用 Supervisor tail"
             else
-                _open_editor "$file"
+                tail -n 100 -- "$file"
             fi
             ;;
     esac
@@ -1485,18 +1625,12 @@ _file_sig() {
 
 # 编辑前备份，成功则输出备份路径；失败返回 1（调用方只 warn，不阻塞编辑）
 _backup_file() {
-    local file="$1"
-    [[ -f "$file" ]] || return 1
-    local dir="$SM_BACKUP_DIR"
-    if ! mkdir -p "$dir" 2>/dev/null; then
-        # 兜底：无权限写 /var/backups 时退到临时目录
-        dir="${TMPDIR:-/tmp}/supervisor-manager-backup"
-        mkdir -p "$dir" 2>/dev/null || return 1
-    fi
-    local dest
-    dest="$dir/$(basename "$file").$(date +%Y%m%d-%H%M%S).$$"
-    cp -a "$file" "$dest" 2>/dev/null || return 1
-    printf '%s' "$dest"
+    local file="$1" dest
+    [[ -f "$file" && ! -L "$file" ]] || return 1
+    _private_dir || return 1
+    dest=$(mktemp "$SM_BACKUP_DIR/${file##*/}.XXXXXXXX") || return 1
+    if ! cat -- "$file" > "$dest" || ! chmod 0600 "$dest"; then rm -f -- "$dest"; return 1; fi
+    printf '%s\n' "$dest"
 }
 
 # 执行 reread + update，返回 0=成功 1=失败
@@ -1526,15 +1660,12 @@ _do_reload() {
 # 列出 supervisord 实际会加载的进程配置文件（完整路径，已去重）
 # 依据 include，而不是硬编码 SM_CONF_DIR —— 详见"配置文件定位"一节
 _list_conf_files() {
-    local f
-    local -A seen=()
+    local f list
+    list=$(_conf_source_files) || return 1
     while IFS= read -r f; do
-        [[ -n "$f" && -f "$f" ]] || continue
-        [[ "$f" == "$SM_MAIN_CONF" ]] && continue
-        [[ -n "${seen[$f]:-}" ]] && continue
-        seen[$f]=1
+        [[ -n "$f" && -f "$f" && ! "$f" -ef "$SM_MAIN_CONF" ]] || continue
         printf '%s\n' "$f"
-    done < <(_conf_source_files)
+    done <<< "$list"
 }
 
 # 列表为空时的诊断：把"为什么空"讲清楚，而不是只说目录为空
@@ -1552,93 +1683,26 @@ _conf_diag_empty() {
     ui_info "也可用 SM_MAIN_CONF=... 或 SM_CONF_DIR=... 指定实际路径后重试"
 }
 
-action_edit() {
+action_edit() (
     require_root || return 1
     ui_title "编辑进程配置"
-
-    local f
-    local files=()
-    while IFS= read -r f; do files+=("$f"); done < <(_list_conf_files)
-    if [[ ${#files[@]} -eq 0 ]]; then
-        ui_error "没有找到任何进程配置文件（supervisord 加载范围内为空）"
-        _conf_diag_empty
-        # 常见情况：进程直接写在主配置里。与其让用户自己去找，不如直接给入口
-        if [[ -f "$SM_MAIN_CONF" ]] && grep -qE '^[[:space:]]*\[program:' "$SM_MAIN_CONF" 2>/dev/null; then
-            local pcnt
-            pcnt=$(grep -cE '^[[:space:]]*\[program:' "$SM_MAIN_CONF" 2>/dev/null)
-            ui_warn "主配置内联定义了 $pcnt 个 [program:x]，不在任何 conf.d 文件里"
-            if ui_confirm "现在编辑主配置?"; then
-                action_edit_main
-                return 0
-            fi
-        fi
-        ui_pause; return 1
-    fi
-    local options=()
-    for f in "${files[@]}"; do options+=("$(basename "$f")"); done
-    if ! ui_menu "选择配置文件" "${options[@]}"; then ui_pause; return 0; fi
-    local choice="$_SM_MENU_CHOICE"
-    [[ "$choice" -eq 0 ]] && { ui_pause; return 0; }
-    local file="${files[$((choice-1))]}"
-
-    # 编辑前备份：改坏配置属不可逆事故，先留一份
-    local bak=""
-    if bak=$(_backup_file "$file"); then
-        ui_info "已备份: $bak"
-    else
-        ui_warn "备份失败（不影响编辑，但改坏后无法自动回滚）"
-    fi
-
-    local sig_before sig_after rc=0
-    sig_before=$(_file_sig "$file")
-    ui_info "编辑: $file"
-    _open_editor "$file" || rc=$?
-
-    if (( rc == 127 )); then
-        ui_pause; return 1                 # 找不到编辑器，_open_editor 已报错
-    elif (( rc != 0 )); then
-        ui_error "编辑器异常退出（退出码 $rc），文件可能没有保存"
-        [[ -n "$bak" ]] && ui_info "如需回滚: cp -a '$bak' '$file'"
-        ui_pause; return 1
-    fi
-
-    sig_after=$(_file_sig "$file")
-    if [[ "$sig_before" == "$sig_after" ]]; then
-        ui_info "文件内容未变化，无需重载"
-        ui_pause; return 0
-    fi
-
-    ui_success "配置文件已修改: $file"
-    [[ -n "$bak" ]] && ui_info "回滚命令: cp -a '$bak' '$file'"
-
-    # 闭环：改完直接问要不要生效，失败可回到编辑器继续改
-    while true; do
-        if ! ui_confirm "是否立即重载让改动生效?"; then
-            ui_warn "已跳过重载。supervisord 仍使用旧配置，稍后可执行菜单 [9]"
-            ui_pause; return 0
-        fi
-        if ! supervisor_alive; then
-            _report_not_alive; ui_pause; return 1
-        fi
-        if _do_reload; then
-            ui_success "改动已生效。当前状态："
-            _render_status_table
-            ui_pause; return 0
-        fi
-        if ! ui_confirm "重载失败，是否重新打开 $file 修改?"; then
-            [[ -n "$bak" ]] && ui_info "回滚命令: cp -a '$bak' '$file'"
-            ui_pause; return 1
-        fi
-        local erc=0
-        _open_editor "$file" || erc=$?
-        if (( erc != 0 )); then
-            ui_error "编辑器异常（退出码 $erc），已退出"
-            [[ -n "$bak" ]] && ui_info "回滚命令: cp -a '$bak' '$file'"
-            ui_pause; return 1
-        fi
-        ui_info "再次尝试重载 ..."
-    done
-}
+    local list f file
+    list=$(_list_conf_files) || return 1
+    local -a files=()
+    while IFS= read -r f; do [[ -n "$f" ]] && files+=("$f"); done <<< "$list"
+    if (( ${#files[@]} == 0 )); then _conf_diag_empty; ui_pause; return 1; fi
+    ui_menu "选择配置文件（可能包含多个进程）" "${files[@]}" || return 0
+    [[ "$_SM_MENU_CHOICE" != 0 ]] || return 0
+    file="${files[$((_SM_MENU_CHOICE-1))]}"
+    _tx_begin "$file" || return 1
+    _open_editor "$_TX_STAGE" || { ui_error "编辑器退出异常，未修改正式配置"; return 1; }
+    if cmp -s -- "$_TX_STAGE" "$_TX_BACKUP"; then ui_info "配置未改变"; return 0; fi
+    ui_confirm "确认保存并应用配置?" "n" || return 0
+    _tx_publish || return 1
+    _tx_apply || return 1
+    ui_success "配置修改完成"
+    ui_pause
+)
 
 # 从一个配置文件里提取受管实体名（[program:x] / [group:x]）
 # 一个 .conf 里可能定义多个 program，直接拿文件名去 stop 会 no such process
@@ -1655,151 +1719,69 @@ _conf_entity_names() {
     ' "$file" 2>/dev/null
 }
 
-action_delete() {
+action_delete() (
     require_root || return 1
-    ui_title "删除守护进程"
-    ui_warn "此操作不可逆，会从磁盘删除配置文件并停止对应进程"
-
-    local f
-    local files=()
-    while IFS= read -r f; do files+=("$f"); done < <(_list_conf_files)
-    if [[ ${#files[@]} -eq 0 ]]; then
-        ui_error "没有找到任何进程配置文件（supervisord 加载范围内为空）"
-        _conf_diag_empty
-        if [[ -f "$SM_MAIN_CONF" ]] && grep -qE '^[[:space:]]*\[program:' "$SM_MAIN_CONF" 2>/dev/null; then
-            ui_warn "有进程是内联写在主配置里的，删文件删不掉它们"
-            ui_info "请用菜单 [11] 编辑主配置，手动移除对应 [program:x] 段后重启"
-        fi
-        ui_pause; return 1
-    fi
-    local options=()
-    for f in "${files[@]}"; do options+=("$(basename "$f")"); done
-    if ! ui_menu "选择要删除的配置" "${options[@]}"; then ui_pause; return 0; fi
-    local choice="$_SM_MENU_CHOICE"
-    [[ "$choice" -eq 0 ]] && { ui_pause; return 0; }
-    local file="${files[$((choice-1))]}"
-
-    # 文件名 ≠ 程序名：按实际 [program:x] 段名来停进程
-    local ents=()
-    while IFS= read -r e; do ents+=("$e"); done < <(_conf_entity_names "$file")
-    if [[ ${#ents[@]} -eq 0 ]]; then
-        ui_warn "该文件里没解析到 [program:x] 段（可能格式有误），仅删除文件"
-    fi
-
-    echo
-    echo -e "${C_RED}${C_BOLD}即将执行：${C_RESET}"
-    if [[ ${#ents[@]} -gt 0 ]]; then
-        echo "  1. supervisorctl stop ${ents[*]}  （停止进程）"
-    else
-        echo "  1. 跳过停止（未解析到程序名）"
-    fi
-    echo "  2. rm -f $file  （删除配置文件）"
-    echo "  3. supervisorctl reread && supervisorctl update"
-    echo
-    if ! ui_confirm "确认删除 [$(basename "$file")]？此操作不可逆！" "n"; then
-        ui_warn "已取消"; ui_pause; return 0
-    fi
-
-    if supervisor_alive && [[ ${#ents[@]} -gt 0 ]]; then
-        ui_info "停止进程: ${ents[*]}"
-        _svctl stop "${ents[@]}" 2>&1 || ui_warn "停止失败（进程可能已停止或状态转换中）"
-    fi
-
-    # 删除前留一份，误删可恢复
-    local bak=""
-    if bak=$(_backup_file "$file"); then
-        ui_info "已备份: $bak"
-    fi
-
-    if ! rm -f "$file" 2>/dev/null; then
-        ui_error "删除配置文件失败: $file"
-        ui_info "检查文件权限与所在目录权限: ls -l $file"
-        ui_pause; return 1
-    fi
-    if [[ -f "$file" ]]; then
-        ui_error "配置文件仍存在，删除未生效: $file"
-        ui_pause; return 1
-    fi
-    ui_info "已删除配置文件: $file"
-
-    if supervisor_alive; then
-        if ! _do_reload; then
-            ui_warn "配置重载失败，supervisord 可能仍认为该进程存在；稍后执行菜单 [9] 重试"
-            [[ -n "$bak" ]] && ui_info "恢复文件: cp -a '$bak' '$file'"
-        fi
-    fi
-    ui_success "已删除: $(basename "$file")"
+    ui_title "删除整个配置文件"
+    local list f file sections
+    list=$(_list_conf_files) || return 1
+    local -a files=()
+    while IFS= read -r f; do [[ -n "$f" ]] && files+=("$f"); done <<< "$list"
+    if (( ${#files[@]} == 0 )); then _conf_diag_empty; return 1; fi
+    ui_menu "选择整个配置文件" "${files[@]}" || return 0
+    [[ "$_SM_MENU_CHOICE" != 0 ]] || return 0
+    file="${files[$((_SM_MENU_CHOICE-1))]}"
+    _tx_begin "$file" || return 1
+    [[ -n "$_TX_BACKUP" ]] || return 1
+    sections=$(_native_conf entities "$_TX_BACKUP") || return 1
+    ui_warn "即将删除 $file 的全部段（不是单个进程）:"
+    printf '%s\n' "$sections"
+    ui_confirm "确认删除整个文件并停止受影响进程组?" "n" || return 0
+    cmp -s -- "$file" "$_TX_BACKUP" || { ui_error "配置已被外部修改"; return 1; }
+    _TX_DIRTY=1
+    rm -- "$file" || return 1
+    _tx_apply || return 1
+    ui_success "已删除配置文件: $file"
     ui_pause
-}
+)
 
-action_reload() {
-    require_root || return 1
-    ui_title "重载 supervisor 配置"
-    if ! supervisor_alive; then
-        _report_not_alive; ui_pause; return 1
-    fi
-    ui_info "执行 reread + update ..."
+action_reload() (
+    _lock_mutation || return 1
+    ui_title "全局重载 Supervisor 配置"
+    _check_daemon_identity || { ui_error "无法验证本机 Supervisor 实例"; return 1; }
+    _native_conf validate "$SM_MAIN_CONF" || return 1
+    ui_warn "全局 update 可能重启所有存在未应用修改的进程组"
+    ui_confirm "确认全局应用?" "n" || return 0
     if _do_reload; then
-        ui_success "重载完成。当前状态："
-        _render_status_table
+        ui_success "重载完成"; _render_status_table
     else
-        ui_warn "未生效：supervisord 仍在用改动前的配置"
-        ui_info "可执行菜单 [8] 编辑对应配置，或 cp -a 备份文件回滚"
+        ui_error "重载失败或部分应用，请检查实际运行状态"
+        ui_pause; return 1
     fi
     ui_pause
-}
+)
 
-action_edit_main() {
+action_edit_main() (
     require_root || return 1
     ui_title "编辑主 supervisord.conf"
-    [[ -f "$SM_MAIN_CONF" ]] || { ui_error "未找到 $SM_MAIN_CONF"; ui_pause; return 1; }
-
-    local bak=""
-    if bak=$(_backup_file "$SM_MAIN_CONF"); then
-        ui_info "已备份: $bak"
+    _conf_ready || return 1
+    _tx_begin "$SM_MAIN_CONF" || return 1
+    _open_editor "$_TX_STAGE" || return 1
+    if cmp -s -- "$_TX_STAGE" "$_TX_BACKUP"; then ui_info "配置未改变"; return 0; fi
+    ui_warn "主配置变更可能影响全部进程；重启会中断业务"
+    ui_confirm "确认保存主配置?" "n" || return 0
+    _tx_publish || return 1
+    _native_conf validate "$SM_MAIN_CONF" || return 1
+    if (( _TX_ONLINE )) && ui_confirm "立即重启 Supervisor 并检查连接?" "n"; then
+        _TX_MAIN_RESTART=1
+        _restart_supervisor || return 1
+        _TX_DIRTY=0
+        ui_success "已保存并重启"
     else
-        ui_warn "备份失败（不影响编辑，但改坏后无法自动回滚）"
-    fi
-
-    local sig_before sig_after rc=0
-    sig_before=$(_file_sig "$SM_MAIN_CONF")
-    ui_info "编辑: $SM_MAIN_CONF"
-    _open_editor "$SM_MAIN_CONF" || rc=$?
-    if (( rc == 127 )); then
-        ui_pause; return 1
-    elif (( rc != 0 )); then
-        ui_error "编辑器异常退出（退出码 $rc），文件可能没有保存"
-        [[ -n "$bak" ]] && ui_info "如需回滚: cp -a '$bak' '$SM_MAIN_CONF'"
-        ui_pause; return 1
-    fi
-
-    sig_after=$(_file_sig "$SM_MAIN_CONF")
-    if [[ "$sig_before" == "$sig_after" ]]; then
-        ui_info "文件内容未变化"
-        ui_pause; return 0
-    fi
-
-    ui_success "主配置已修改: $SM_MAIN_CONF"
-    [[ -n "$bak" ]] && ui_info "回滚命令: cp -a '$bak' '$SM_MAIN_CONF'"
-
-    # 主配置改的是端口/socket/日志级别等，reread 不生效，必须重启 supervisord
-    local svc="supervisor"
-    if systemctl cat supervisord >/dev/null 2>&1 && ! systemctl cat supervisor >/dev/null 2>&1; then
-        svc="supervisord"
-    fi
-    ui_warn "主配置的改动需要重启 supervisord 才会生效（reread 不够）"
-    ui_info "重启命令: systemctl restart $svc"
-    if ui_confirm "现在重启 $svc?" "n"; then
-        if systemctl restart "$svc"; then
-            ui_success "已重启 $svc"
-        else
-            ui_error "重启失败，请手动执行: systemctl restart $svc && systemctl status $svc -l"
-        fi
-    else
-        ui_info "未重启。改动尚未生效"
+        _TX_DIRTY=0
+        ui_warn "主配置已保存且通过解析；全局设置需下次重启才能生效"
     fi
     ui_pause
-}
+)
 
 # ============================================================================
 #  主菜单
