@@ -39,7 +39,7 @@
 # 改为各 action 内部显式 return/error 处理。
 set -uo pipefail
 
-SM_VERSION="1.6.1"
+SM_VERSION="1.6.2"
 
 # 配置默认值（可被环境变量覆盖）
 SM_CONF_DIR="${SM_CONF_DIR:-/etc/supervisor/conf.d}"
@@ -99,6 +99,14 @@ _detect_serial() {
     return 1
 }
 if _detect_serial; then _SM_SERIAL=1; fi
+# Milliseconds between complete UI lines/prompts, only in serial mode.
+# Bound the value to avoid accidental multi-minute stalls.
+_SM_SERIAL_DELAY_MS="${SM_SERIAL_DELAY_MS:-50}"
+if [[ ! "$_SM_SERIAL_DELAY_MS" =~ ^[0-9]{1,4}$ ]] || (( 10#$_SM_SERIAL_DELAY_MS > 1000 )); then
+    _SM_SERIAL_DELAY_MS=50
+fi
+_SM_SERIAL_DELAY_MS=$((10#$_SM_SERIAL_DELAY_MS))
+printf -v _SM_SERIAL_DELAY '%d.%03d' "$((_SM_SERIAL_DELAY_MS / 1000))" "$((_SM_SERIAL_DELAY_MS % 1000))"
 # ---------------------- 颜色 ----------------------
 if [[ -t 1 && "$_SM_SERIAL" == 0 && "${SM_COLOR:-1}" != 0 ]]; then
     C_RESET=$'\033[0m'; C_RED=$'\033[31m'; C_GREEN=$'\033[32m'; C_YELLOW=$'\033[33m'
@@ -361,9 +369,74 @@ _ensure_utf8_locale() {
 #  UI 工具函数
 # ============================================================================
 
+# UI-only output. Internal data, config files, process logs and RPC traffic
+# must not pass through these helpers. Keep each line intact and pace writes
+# to a serial console; prompts are printed before read, not by read -p.
+_ui_delay() {
+    if (( _SM_SERIAL && _SM_SERIAL_DELAY_MS > 0 )); then
+        sleep "$_SM_SERIAL_DELAY" || true
+    fi
+    return 0
+}
+
+_ui_write() {
+    local message="$1" line
+    if (( ! _SM_SERIAL || _SM_SERIAL_DELAY_MS == 0 )); then
+        printf '%s' "$message"
+        return $?
+    fi
+    while [[ "$message" == *$'\n'* ]]; do
+        line="${message%%$'\n'*}"
+        printf '%s' "$line"$'\n' || return 1
+        _ui_delay
+        message="${message#*$'\n'}"
+    done
+    if [[ -n "$message" ]]; then
+        printf '%s' "$message" || return 1
+        _ui_delay
+    fi
+    return 0
+}
+
+_ui_print() {
+    local value
+    if (( $# == 0 )); then _ui_write $'\n'; return $?; fi
+    for value in "$@"; do
+        _ui_write "$value"$'\n' || return 1
+    done
+}
+
+_ui_printf() {
+    local rendered
+    printf -v rendered "$@" || return 1
+    _ui_write "$rendered"
+}
+
+_ui_here() {
+    if (( ! _SM_SERIAL || _SM_SERIAL_DELAY_MS == 0 )); then cat; return $?; fi
+    local line
+    while IFS= read -r line; do
+        _ui_print "$line" || return 1
+    done
+    if [[ -n "$line" ]]; then _ui_write "$line" || return 1; fi
+    return 0
+}
+
+_ui_read_prompt() {
+    local prompt_text="$1"; shift
+    if (( _SM_SERIAL )); then
+        # Preserve read -p semantics when input is piped; interactive prompts
+        # go to stderr so command substitutions only capture the user's value.
+        if [[ -t 0 ]]; then _ui_write "$prompt_text" >&2 || return 1; fi
+        read -r "$@"
+    else
+        read -r -p "$prompt_text" "$@"
+    fi
+}
+
 ui_line() {
     local char="${1:--}"; local len="${2:-$SM_WIDTH}"
-    _rule "$len" "$char"; printf '%s\n' "$_SM_PAD"
+    _rule "$len" "$char"; _ui_print "$_SM_PAD"
 }
 
 _ui_text() {
@@ -371,15 +444,15 @@ _ui_text() {
 }
 
 ui_title() {
-    echo
-    echo -e "${C_BG_BLUE}${C_BOLD} $1 ${C_RESET}"
+    _ui_print
+    _ui_print "${C_BG_BLUE}${C_BOLD} $1 ${C_RESET}"
     ui_line '='
 }
 
 # 四种前缀统一成 7 个字符，后面的正文才能左对齐
 _ui_message() {
     # Language is chosen at the call site. Preserve paths and error details.
-    printf '%s\n' "$*"
+    _ui_print "$*"
 }
 ui_info()    { _ui_message "${C_GREEN}[INFO]${C_RESET}  $*"; }
 ui_warn()    { _ui_message "${C_YELLOW}[WARN]${C_RESET}  $*"; }
@@ -395,7 +468,7 @@ ui_ask() {
         printf -v p "${C_BOLD}%s${C_RESET}: " "$prompt"
     fi
 
-    read -r -p "$p" input || return 1
+    _ui_read_prompt "$p" input || return 1
     if [[ -z "$input" && -n "$default" ]]; then echo "$default"
     else printf '%s\n' "$input"; fi
 }
@@ -406,27 +479,27 @@ ui_confirm() {
 
     while true; do
         if [[ "$default" == "y" ]]; then
-            read -r -p "$(echo -e "${C_BOLD}${prompt}${C_RESET} [Y/n]: ")" input || return 1
+            _ui_read_prompt "${C_BOLD}${prompt}${C_RESET} [Y/n]: " input || return 1
             input="${input:-y}"
         else
-            read -r -p "$(echo -e "${C_BOLD}${prompt}${C_RESET} [y/N]: ")" input || return 1
+            _ui_read_prompt "${C_BOLD}${prompt}${C_RESET} [y/N]: " input || return 1
             input="${input:-n}"
         fi
         case "$input" in
             y|Y|yes|YES) return 0 ;;
             n|N|no|NO)    return 1 ;;
-            *) printf '  %s\n' "$(_ui_text "请输入 y 或 n" "Enter y or n")" ;;
+            *) _ui_printf '  %s\n' "$(_ui_text "请输入 y 或 n" "Enter y or n")" ;;
         esac
     done
 }
 
 ui_pause() {
-    echo
+    _ui_print
     # 仅在 stdin 是 tty 时阻塞等用户按键，否则直接返回
     if [ -t 0 ]; then
-        if (( _SM_SERIAL )); then read -r -p "$(_ui_text "按回车键继续..." "Press Enter to continue...")" _ || true; return 0; fi
+        if (( _SM_SERIAL )); then _ui_read_prompt "$(_ui_text "按回车键继续..." "Press Enter to continue...")" _ || true; return 0; fi
         read -r -N 1 -s -p "${C_GRAY}$(_ui_text "按任意键继续..." "Press any key to continue...")${C_RESET}" _ || true
-        echo
+        _ui_print
     fi
 }
 
@@ -863,7 +936,7 @@ _show_profile() {
     local mode
     if [[ "$_SM_PROFILE" == auto ]]; then mode=$(_ui_text "自动选择" "Automatic")
     else mode=$(_ui_text "手动选择" "Selected manually"); fi
-    printf '  %s: %s (%s)\n  %s: %s\n  %s: %s\n  %s: %s\n' \
+    _ui_printf '  %s: %s (%s)\n  %s: %s\n  %s: %s\n  %s: %s\n' \
         "$(_ui_text "当前实例" "Instance")" "$(_profile_name "${_SM_ACTIVE_PROFILE:-none}")" "$mode" \
         "$(_ui_text "主程序" "supervisord")" "${_SM_DAEMON:--}" \
         "$(_ui_text "控制程序" "supervisorctl")" "${_SM_CTL:--}" \
@@ -917,15 +990,15 @@ ui_menu() {
         local i=1
         for opt in "${options[@]}"; do
 
-            printf "  ${C_CYAN}%2d${C_RESET}) %s\n" "$i" "$opt"
+            _ui_printf "  ${C_CYAN}%2d${C_RESET}) %s\n" "$i" "$opt"
             ((i++))
         done
-        echo -e "  ${C_GRAY}0) ${zero_label}${C_RESET}"
-        echo
+        _ui_print "  ${C_GRAY}0) ${zero_label}${C_RESET}"
+        _ui_print
         local choice=""
         local selection_prompt
         selection_prompt=$(_ui_text "请选择" "Select")
-        read -r -p "${C_BOLD}$selection_prompt${C_RESET} [0-${#options[@]}]: " choice || return 1
+        _ui_read_prompt "${C_BOLD}$selection_prompt${C_RESET} [0-${#options[@]}]: " choice || return 1
         # 去除空白（用户可能多按空格）
         choice="${choice// /}"
         # 直接回车 = 不选择，静默重绘（不报错，避免误触时噪音）
@@ -1116,10 +1189,10 @@ EOF
     fi
 
     ui_info "$(_ui_text "目录结构:" "Directory layout:")"
-    echo "$(_ui_text "  主配置:        $SM_MAIN_CONF" "  Config:        $SM_MAIN_CONF")"
-    echo "$(_ui_text "  子进程配置目录: $SM_CONF_DIR" "  Config dir:    $SM_CONF_DIR")"
-    echo "$(_ui_text "  日志目录:      $SM_LOG_DIR" "  Log dir:       $SM_LOG_DIR")"
-    echo "$(_ui_text "  PID/Run 目录:  $SM_RUN_DIR" "  PID/Run dir:   $SM_RUN_DIR")"
+    _ui_print "$(_ui_text "  主配置:        $SM_MAIN_CONF" "  Config:        $SM_MAIN_CONF")"
+    _ui_print "$(_ui_text "  子进程配置目录: $SM_CONF_DIR" "  Config dir:    $SM_CONF_DIR")"
+    _ui_print "$(_ui_text "  日志目录:      $SM_LOG_DIR" "  Log dir:       $SM_LOG_DIR")"
+    _ui_print "$(_ui_text "  PID/Run 目录:  $SM_RUN_DIR" "  PID/Run dir:   $SM_RUN_DIR")"
 
     ui_pause
 )
@@ -1149,7 +1222,7 @@ action_boot() (
     else boot_label=$(_ui_text "未启用" "Disabled"); fi
     if [[ "$cur_active" == active ]]; then state_label=$(_ui_text "运行中" "Running")
     else state_label=$(_ui_text "未运行" "Inactive"); fi
-    printf '  %s: %s\n  %s: %s\n  %s: %s\n' "$(_ui_text "服务名称" "Service")" "$svc" \
+    _ui_printf '  %s: %s\n  %s: %s\n  %s: %s\n' "$(_ui_text "服务名称" "Service")" "$svc" \
         "$(_ui_text "开机自启" "Boot")" "$boot_label" "$(_ui_text "运行状态" "State")" "$state_label"
     if [[ "$cur_state" == enabled && "$cur_active" == active ]]; then
         ui_confirm "$(_ui_text "禁用开机自启并停止当前实例？" "Disable and stop selected instance?")" "n" || return 0
@@ -1191,25 +1264,25 @@ _supervisor_status_raw() {
 # 返回 0=正常, 1=supervisord 不可用, 2=无受管进程
 _render_status_table() {
     if (( _SM_SERIAL || _SM_ENGLISH )); then
-        if ! has_supervisord; then printf '%s\n' "$(_ui_text "未找到可用实例，请选择 [1] 安装或 [12] 选择实例。" "No instance selected. Use menu 1 or 12.")"; return 1; fi
-        if ! supervisor_alive; then printf '%s\n' "$(_ui_text "当前实例未运行或无法验证，请检查菜单 [2] 或 [12]。" "Selected daemon offline or unverified. Use menu 2 or 12.")"; return 1; fi
+        if ! has_supervisord; then _ui_printf '%s\n' "$(_ui_text "未找到可用实例，请选择 [1] 安装或 [12] 选择实例。" "No instance selected. Use menu 1 or 12.")"; return 1; fi
+        if ! supervisor_alive; then _ui_printf '%s\n' "$(_ui_text "当前实例未运行或无法验证，请检查菜单 [2] 或 [12]。" "Selected daemon offline or unverified. Use menu 2 or 12.")"; return 1; fi
         local raw rc=0
         raw=$(_supervisor_status_raw) || rc=$?
-        if (( rc != 0 && rc != 3 )); then printf '%s\n' "$(_ui_text "状态查询失败。" "Status query failed.")"; return 1; fi
-        if [[ -z "$raw" ]]; then printf '%s\n' "$(_ui_text "暂无受管进程。" "No managed processes.")"; return 2; fi
-        printf '%s\n' "$(_ui_text "进程状态：" "Process status:")" "$raw"
+        if (( rc != 0 && rc != 3 )); then _ui_printf '%s\n' "$(_ui_text "状态查询失败。" "Status query failed.")"; return 1; fi
+        if [[ -z "$raw" ]]; then _ui_printf '%s\n' "$(_ui_text "暂无受管进程。" "No managed processes.")"; return 2; fi
+        _ui_printf '%s\n' "$(_ui_text "进程状态：" "Process status:")" "$raw"
         return 0
     fi
     if ! has_supervisord; then
-        echo -e "  ${C_YELLOW}未找到可用实例${C_RESET}  → 请选择 [1] 安装或 [12] 选择实例"
+        _ui_print "  ${C_YELLOW}未找到可用实例${C_RESET}  → 请选择 [1] 安装或 [12] 选择实例"
         return 1
     fi
     if ! supervisor_alive; then
         local diag; diag=$(_supervisor_diag)
         if [[ "$diag" == "no_permission" ]]; then
-            echo -e "  ${C_RED}无权访问 supervisord socket${C_RESET}  → 请用 sudo 运行"
+            _ui_print "  ${C_RED}无权访问 supervisord socket${C_RESET}  → 请用 sudo 运行"
         else
-            echo -e "  ${C_RED}supervisord 未运行${C_RESET}  → 请选择 [2] 启动并配置开机自启"
+            _ui_print "  ${C_RED}supervisord 未运行${C_RESET}  → 请选择 [2] 启动并配置开机自启"
         fi
         return 1
     fi
@@ -1219,11 +1292,11 @@ _render_status_table() {
     # 124 = timeout 主动超时；此时 raw 为空，不能误报"暂无受管进程"
     # 注意：supervisorctl status 在有异常进程时本身返回 3，属正常，不能当错误处理
     if (( rc == 124 )); then
-        echo -e "  ${C_RED}状态查询超时（supervisord 可能卡死）${C_RESET}  → 检查 $SM_LOG_DIR/supervisord.log"
+        _ui_print "  ${C_RED}状态查询超时（supervisord 可能卡死）${C_RESET}  → 检查 $SM_LOG_DIR/supervisord.log"
         return 1
     fi
     if [[ -z "$raw" ]]; then
-        echo -e "  ${C_GRAY}（暂无受管进程，选择 [3] 添加）${C_RESET}"
+        _ui_print "  ${C_GRAY}（暂无受管进程，选择 [3] 添加）${C_RESET}"
         return 2
     fi
 
@@ -1550,8 +1623,8 @@ action_add() (
         ui_pause; return 1
     fi
 
-    echo -e "${C_GRAY}$(_ui_text "按提示逐步填写，留空使用默认值。Ctrl+C 取消。" "Fill in fields; blank uses defaults. Ctrl+C cancels.")${C_RESET}"
-    echo
+    _ui_print "${C_GRAY}$(_ui_text "按提示逐步填写，留空使用默认值。Ctrl+C 取消。" "Fill in fields; blank uses defaults. Ctrl+C cancels.")${C_RESET}"
+    _ui_print
 
     local name command user directory autostart autorestart stdout_log stderr_log priority env_str
 
@@ -1615,17 +1688,17 @@ action_add() (
     [[ -d "$directory" && "$directory" == /* ]] || { ui_error "$(_ui_text "工作目录必须为存在的绝对路径" "Working directory must be an existing absolute path")"; return 1; }
 
     ui_title "$(_ui_text "预览配置" "Preview configuration")"
-    echo "[program:$name]"
-    echo "command=$command"
-    echo "directory=$directory"
-    echo "user=$user"
-    echo "autostart=$autostart"
-    echo "autorestart=$autorestart"
-    echo "priority=$priority"
-    echo "stdout_logfile=$stdout_log"
-    echo "stderr_logfile=$stderr_log"
-    [[ -n "$env_str" ]] && echo "$(_ui_text "environment=（已隐藏）" "environment=(hidden)")"
-    echo
+    _ui_print "[program:$name]"
+    _ui_print "command=$command"
+    _ui_print "directory=$directory"
+    _ui_print "user=$user"
+    _ui_print "autostart=$autostart"
+    _ui_print "autorestart=$autorestart"
+    _ui_print "priority=$priority"
+    _ui_print "stdout_logfile=$stdout_log"
+    _ui_print "stderr_logfile=$stderr_log"
+    [[ -n "$env_str" ]] && _ui_print "$(_ui_text "environment=（已隐藏）" "environment=(hidden)")"
+    _ui_print
 
     if ! ui_confirm "$(_ui_text "确认写入并加载?" "Write and load configuration?")"; then
         ui_warn "$(_ui_text "已取消" "Cancelled")"; ui_pause; return 0
@@ -1750,8 +1823,8 @@ action_log() {
     case "$act" in
         1) _svctl tail "$name" stdout ;;
         2) _svctl tail "$name" stderr ;;
-        3) echo -e "${C_GRAY}$(_ui_text "Ctrl+C 退出" "Ctrl+C to exit")${C_RESET}"; _svctl tail -f "$name" stdout ;;
-        4) echo -e "${C_GRAY}$(_ui_text "Ctrl+C 退出" "Ctrl+C to exit")${C_RESET}"; _svctl tail -f "$name" stderr ;;
+        3) _ui_print "${C_GRAY}$(_ui_text "Ctrl+C 退出" "Ctrl+C to exit")${C_RESET}"; _svctl tail -f "$name" stdout ;;
+        4) _ui_print "${C_GRAY}$(_ui_text "Ctrl+C 退出" "Ctrl+C to exit")${C_RESET}"; _svctl tail -f "$name" stderr ;;
         5|6)
             local key
             if [[ "$act" -eq 5 ]]; then key=stdout_logfile; else key=stderr_logfile; fi
@@ -1892,7 +1965,7 @@ action_delete() (
     [[ -n "$_TX_BACKUP" ]] || return 1
     sections=$(_native_conf entities "$_TX_BACKUP") || return 1
     ui_warn "$(_ui_text "即将删除 $file 的全部段（不是单个进程）:" "All sections in $file will be removed:")"
-    printf '%s\n' "$sections"
+    _ui_printf '%s\n' "$sections"
     ui_confirm "$(_ui_text "确认删除整个文件并停止受影响进程组?" "Delete file and stop affected groups?")" "n" || return 0
     cmp -s -- "$file" "$_TX_BACKUP" || { ui_error "$(_ui_text "配置已被外部修改" "Configuration changed externally")"; return 1; }
     _TX_DIRTY=1
@@ -1952,7 +2025,7 @@ main_menu() {
         # _SM_SKIP_CLEAR=1 用于跳过本次清屏（看日志回来时保留刚读到的内容）
         if [[ "${_SM_SKIP_CLEAR:-0}" == "1" ]]; then
             _SM_SKIP_CLEAR=0
-            echo
+            _ui_print
         else
             _clear_screen
         fi
@@ -1980,7 +2053,7 @@ main_menu() {
             "$(_ui_text "Supervisor 实例选择" "Select Supervisor instance")" \
             "$(_ui_text "卸载 SVM 管理工具" "Uninstall SVM manager")"; then
             # EOF（Ctrl-D / 管道结束）
-            echo "$(_ui_text "再见" "Bye")"; exit 0
+            _ui_print "$(_ui_text "再见" "Bye")"; exit 0
         fi
         local choice="$_SM_MENU_CHOICE"
         case "$choice" in
@@ -1997,7 +2070,7 @@ main_menu() {
             11) action_edit_main ;;
             12) _action_profiles ;;
             13) action_self_uninstall ;;
-            0)  echo "$(_ui_text "再见" "Bye")"; exit 0 ;;
+            0)  _ui_print "$(_ui_text "再见" "Bye")"; exit 0 ;;
         esac
     done
 }
@@ -2068,7 +2141,7 @@ self_install() {
             --force|-f)
                 force=1; shift ;;
             --help|-h)
-                cat <<EOF
+                _ui_here <<EOF
 用法: sm.sh --install [--as NAME] [--path PATH] [--force]
 
   --as NAME      指定安装后的命令名（默认 svm，冲突则自动尝试 svmgr/supmgr）
@@ -2153,7 +2226,7 @@ EOF
     fi
 
     # 升级/安装后的完整性检查：supervisord 与其开机自启状态
-    echo
+    _ui_print
     ui_info "$(_ui_text "── 环境检查 ──" "Environment check")"
     if has_supervisord; then
         ui_info "$(_ui_text "supervisord 已安装:" "supervisord installed:") $("$_SM_DAEMON" --version 2>/dev/null | head -1)"
@@ -2164,7 +2237,7 @@ EOF
         fi
         local svc
         if svc=$(_matching_unit 2>/dev/null); then
-            printf '  %s: %s\n' "$(_ui_text "服务名称" "Service")" "$svc"
+            _ui_printf '  %s: %s\n' "$(_ui_text "服务名称" "Service")" "$svc"
             if systemctl is-enabled "$svc" >/dev/null 2>&1; then
                 ui_info "$(_ui_text "开机自启：已启用" "Boot: enabled")"
             else
@@ -2177,10 +2250,10 @@ EOF
 
     # 提示典型用法
     if (( _SM_ENGLISH )); then
-        printf '\nCommon commands:\n  %s             # interactive menu\n  %s --install   # install/upgrade\n  %s -c status   # show status\n' "$final_name" "$final_name" "$final_name"
+        _ui_printf '\nCommon commands:\n  %s             # interactive menu\n  %s --install   # install/upgrade\n  %s -c status   # show status\n' "$final_name" "$final_name" "$final_name"
         return 0
     fi
-    cat <<EOF
+    _ui_here <<EOF
 
 ${C_GRAY}── 常用入口 ──${C_RESET}
   $final_name              # 进入交互菜单
@@ -2215,10 +2288,10 @@ self_uninstall() (
 )
 usage() {
     if (( _SM_ENGLISH )); then
-        printf 'Supervisor Manager v%s\n  svm                  Interactive menu\n  svm --install        Install/upgrade\n  svm --uninstall      Remove manager only\n  svm -c status        Show status\n  svm --version         Version\n  SM_SERIAL=0 svm      Force normal interface\n  SM_LANG=zh svm       Chinese interface\n  SM_PROFILE=package|mw|auto svm  Select profile (choose one)\n  SM_SUPERVISORD=/path SM_SUPERVISORCTL=/path SM_MAIN_CONF=/path svm\n' "$SM_VERSION"
+        _ui_printf 'Supervisor Manager v%s\n  svm                  Interactive menu\n  svm --install        Install/upgrade\n  svm --uninstall      Remove manager only\n  svm -c status        Show status\n  svm --version         Version\n  SM_SERIAL=0 svm      Force normal interface\n  SM_SERIAL_DELAY_MS=50 svm  Serial UI delay (milliseconds; 0 disables)\n  SM_LANG=zh svm       Chinese interface\n  SM_PROFILE=package|mw|auto svm  Select profile (choose one)\n  SM_SUPERVISORD=/path SM_SUPERVISORCTL=/path SM_MAIN_CONF=/path svm\n' "$SM_VERSION"
         return 0
     fi
-    cat <<EOF
+    _ui_here <<EOF
 ${C_BOLD}Supervisor Manager v$SM_VERSION${C_RESET}
 
 用法:
@@ -2249,6 +2322,7 @@ ${C_BOLD}Supervisor Manager v$SM_VERSION${C_RESET}
   SM_BACKUP_DIR               编辑/删除前的自动备份目录
   SM_NO_CLEAR=1               禁用首页清屏（保留终端滚动历史）
   SM_SERIAL=1/0               强制开启/关闭串口简化显示（默认自动识别）
+  SM_SERIAL_DELAY_MS=50        串口界面每行/提示间隔毫秒（0-1000，0 关闭）
   SM_LANG=zh/en               界面语言（默认中文，英文可选）
   SM_COLOR=0                  禁用颜色
   SM_LOCALE=0                 关闭 locale 自适应；SM_LOCALE=<name> 指定 UTF-8 locale
@@ -2309,7 +2383,7 @@ if [[ $# -ge 1 && "${SM_NO_ENTRY:-0}" != "1" ]]; then
             exit $?
             ;;
         --version|-V)
-            echo "Supervisor Manager v$SM_VERSION"
+            _ui_print "Supervisor Manager v$SM_VERSION"
             exit 0
             ;;
         *)
