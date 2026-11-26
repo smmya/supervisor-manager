@@ -664,7 +664,8 @@ _check_daemon_identity() {
     [[ "$pid" =~ ^[0-9]+$ && -r "/proc/$pid/comm" ]] || return 1
     IFS= read -r comm < "/proc/$pid/comm" || return 1
     if [[ "$comm" != supervisord ]]; then
-        tr '\0' '\n' < "/proc/$pid/cmdline" | grep -Eq '(^|/)supervisord
+        tr '\0' '\n' < "/proc/$pid/cmdline" | grep -E '(^|/)supervisord$' >/dev/null || return 1
+    fi
     [[ -z "$_SM_DAEMON_PID" || "$pid" == "$_SM_DAEMON_PID" ]] || return 1
     detected=$(_daemon_config "$pid") || detected=""
     if [[ -n "$detected" ]]; then
@@ -959,6 +960,7 @@ EOF
                 svc_name=supervisor
             fi
 
+            _unit_matches_conf "$svc_name" || return 1
             local cur_state=disabled cur_active=inactive
             systemctl is-enabled "$svc_name" >/dev/null 2>&1 && cur_state=enabled
             systemctl is-active "$svc_name"  >/dev/null 2>&1 && cur_active=active
@@ -1328,8 +1330,8 @@ _tx_publish() {
     else
         [[ ! -e "$_TX_TARGET" && ! -L "$_TX_TARGET" ]] || { ui_error "目标已存在"; return 1; }
     fi
+    _atomic_publish "$_TX_STAGE" "$_TX_TARGET" || return 1
     _TX_DIRTY=1
-    _atomic_publish "$_TX_STAGE" "$_TX_TARGET"
 }
 
 _tx_apply() {
@@ -1352,6 +1354,17 @@ _tx_apply() {
     _TX_DIRTY=0
 }
 
+_unit_matches_conf() {
+    local line path
+    line=$(systemctl show "$1" -p ExecStart --value 2>/dev/null) || return 1
+    if [[ "$line" =~ [[:space:]](-c|--configuration)[[:space:]]+([^[:space:]\;\}]+) ]]; then
+        path="${BASH_REMATCH[2]}"
+        [[ "$path" == /* && "$path" -ef "$SM_MAIN_CONF" ]] && return 0
+    fi
+    ui_error "无法确认 unit $1 使用当前配置，请手动操作"
+    return 1
+}
+
 _restart_supervisor() {
     local init svc="" cand waited=0
     init=$(detect_init)
@@ -1366,6 +1379,7 @@ _restart_supervisor() {
                 fi
             done
             [[ -n "$svc" ]] || return 1
+            _unit_matches_conf "$svc" || return 1
             systemctl restart "$svc" || return 1;;
         openrc)
             for cand in supervisor supervisord; do
@@ -1377,8 +1391,9 @@ _restart_supervisor() {
             rc-service "$svc" restart || return 1;;
         *) ui_error "未知 init，请手动重启"; return 1;;
     esac
+    _SM_DAEMON_PID=""
     while (( waited < 20 )); do
-        supervisor_alive && return 0
+        if supervisor_alive && _check_daemon_identity; then return 0; fi
         sleep 0.5; ((waited++))
     done
     return 1
@@ -1538,9 +1553,10 @@ action_start()   { _action_ctl "启动" "start"; }
 action_stop()    { _action_ctl "停止"  "stop"; }
 action_restart() { _action_ctl "重启"  "restart"; }
 
-_action_ctl() {
+_action_ctl() (
     local op="$1"; local cmd="$2"
     ui_title "${op}进程"
+    _lock_mutation || return 1
     if ! supervisor_alive; then
         _report_not_alive; ui_pause; return 1
     fi
@@ -1556,7 +1572,7 @@ _action_ctl() {
         ui_error "${op}失败"
     fi
     ui_pause
-}
+)
 
 # ============================================================================
 #  模块: 日志
