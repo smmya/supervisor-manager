@@ -120,15 +120,15 @@ SM_MAIN_CONF="$conf_a"
 _load_profile
 [[ "$SM_MAIN_CONF" == "$conf_b" ]]
 # Serial defaults to Chinese, with no ANSI escape bytes.
-serial_help=$(env -u SM_LANG SM_NO_ENTRY=0 SM_SERIAL=1 SM_SERIAL_DELAY_MS=0 bash ./sm.sh --help)
+serial_help=$(env -u SM_LANG SM_NO_ENTRY=0 SM_SERIAL=1 SM_SERIAL_DELAY_MS=0 SM_SERIAL_CHAR_DELAY_MS=0 bash ./sm.sh --help)
 [[ "$serial_help" == *"进入交互式菜单"* ]]
 [[ "$serial_help" != *$'\033'* ]]
-english_help=$(SM_LANG=en SM_NO_ENTRY=0 SM_SERIAL=1 SM_SERIAL_DELAY_MS=0 bash ./sm.sh --help)
+english_help=$(SM_LANG=en SM_NO_ENTRY=0 SM_SERIAL=1 SM_SERIAL_DELAY_MS=0 SM_SERIAL_CHAR_DELAY_MS=0 bash ./sm.sh --help)
 [[ "$english_help" == *"Interactive menu"* ]]
 [[ "$english_help" != *$'\033'* ]]
 [[ "$(printf '%s' "$english_help" | LC_ALL=C tr -cd '\11\12\15\40-\176')" == "$english_help" ]]
 # The default interface must be Chinese for both serial and SSH display paths.
-printf '0\n' | env -u SM_LANG SM_NO_ENTRY=0 SM_SERIAL=1 SM_SERIAL_DELAY_MS=0 SM_MAIN_CONF="$conf_b" bash ./sm.sh > "$tmp/serial-zh.out"
+printf '0\n' | env -u SM_LANG SM_NO_ENTRY=0 SM_SERIAL=1 SM_SERIAL_DELAY_MS=0 SM_SERIAL_CHAR_DELAY_MS=0 SM_MAIN_CONF="$conf_b" bash ./sm.sh > "$tmp/serial-zh.out"
 grep -q '当前实例: 手动指定版本 (手动选择)' "$tmp/serial-zh.out"
 grep -q '主程序:' "$tmp/serial-zh.out"
 grep -q '控制程序:' "$tmp/serial-zh.out"
@@ -141,10 +141,10 @@ grep -q '主配置文件:' "$tmp/normal-zh.out"
 mkdir -m 700 "$tmp/bin"
 install -m 755 ./sm.sh "$tmp/bin/svm"
 # Cancellation leaves the test copy installed; confirmation removes only it.
-printf '13\nn\n0\n' | env -u SM_LANG SM_NO_ENTRY=0 SM_SERIAL=1 SM_SERIAL_DELAY_MS=0 SM_MAIN_CONF="$conf_b" bash "$tmp/bin/svm" > "$tmp/cancel.out"
+printf '13\nn\n0\n' | env -u SM_LANG SM_NO_ENTRY=0 SM_SERIAL=1 SM_SERIAL_DELAY_MS=0 SM_SERIAL_CHAR_DELAY_MS=0 SM_MAIN_CONF="$conf_b" bash "$tmp/bin/svm" > "$tmp/cancel.out"
 [[ -f "$tmp/bin/svm" ]]
 grep -q '卸载 SVM 管理工具' "$tmp/cancel.out"
-printf '13\ny\n' | env SM_LANG=en SM_NO_ENTRY=0 SM_SERIAL=1 SM_SERIAL_DELAY_MS=0 SM_MAIN_CONF="$conf_b" bash "$tmp/bin/svm" > "$tmp/uninstall.out"
+printf '13\ny\n' | env SM_LANG=en SM_NO_ENTRY=0 SM_SERIAL=1 SM_SERIAL_DELAY_MS=0 SM_SERIAL_CHAR_DELAY_MS=0 SM_MAIN_CONF="$conf_b" bash "$tmp/bin/svm" > "$tmp/uninstall.out"
 [[ ! -e "$tmp/bin/svm" ]]
 grep -q 'Manager removed' "$tmp/uninstall.out"
 [[ "$(supervisorctl -c "$conf_a" pid)" == "$pid_a" ]]
@@ -159,6 +159,7 @@ echo 'Multi-instance, serial and uninstall regression tests passed'
     _SM_SERIAL=1
     _SM_SERIAL_DELAY_MS=150
     _SM_SERIAL_DELAY=0.150
+    _SM_SERIAL_CHAR_DELAY_MS=0
     sleep() { printf '%s\n' "$1" >> "$tmp/ui-sleeps"; }
     : > "$tmp/ui-sleeps"
     _ui_printf '%s\n%s\n' '确认安装/升级' '主配置文件' > "$tmp/ui-paced"
@@ -182,3 +183,47 @@ env -u SM_SERIAL_DELAY_MS SM_NO_ENTRY=1 SM_SERIAL=1 bash -c 'source ./sm.sh; [[ 
 SM_SERIAL_DELAY_MS=invalid SM_NO_ENTRY=1 SM_SERIAL=1 bash -c 'source ./sm.sh; [[ "$_SM_SERIAL_DELAY_MS" == 150 && "$_SM_SERIAL_DELAY" == 0.150 ]]'
 SM_SERIAL_DELAY_MS=300 SM_NO_ENTRY=1 SM_SERIAL=1 bash -c 'source ./sm.sh; [[ "$_SM_SERIAL_DELAY_MS" == 300 && "$_SM_SERIAL_DELAY" == 0.300 ]]'
 echo 'Serial default delay regression tests passed'
+
+# Verify UTF-8 character boundaries in both C and C.UTF-8 locales. The
+# intercepted printf records every output chunk, not only the final bytes.
+for test_locale in C C.UTF-8; do
+(
+    export LC_ALL="$test_locale"
+    _SM_SERIAL=1
+    _SM_SERIAL_DELAY_MS=150
+    _SM_SERIAL_DELAY=0.150
+    _SM_SERIAL_CHAR_DELAY_MS=3
+    _SM_SERIAL_CHAR_DELAY=0.003
+    sleep() { builtin printf '%s\n' "$1" >> "$tmp/ui-char-sleeps"; }
+    printf() {
+        if [[ $# == 2 && "$1" == '%s' ]]; then
+            builtin printf '%s\n' "$2" >> "$tmp/ui-char-chunks"
+        fi
+        builtin printf "$@"
+    }
+    : > "$tmp/ui-char-sleeps"
+    : > "$tmp/ui-char-chunks"
+    _ui_write $'A\xe4\xb8\xad\xc3\xa9\xf0\x9f\x98\x80\n' > "$tmp/ui-char-output"
+    builtin printf 'A\xe4\xb8\xad\xc3\xa9\xf0\x9f\x98\x80\n' | cmp - "$tmp/ui-char-output"
+    builtin printf 'A\n\xe4\xb8\xad\n\xc3\xa9\n\xf0\x9f\x98\x80\n\n\n' | cmp - "$tmp/ui-char-chunks"
+    [[ "$(cat "$tmp/ui-char-sleeps")" == $'0.003\n0.003\n0.003\n0.003\n0.003\n0.150' ]]
+    : > "$tmp/ui-char-sleeps"
+    _SM_SERIAL_DELAY_MS=0
+    _ui_write '中文' > "$tmp/ui-char-output"
+    [[ "$(cat "$tmp/ui-char-output")" == '中文' ]]
+    [[ "$(cat "$tmp/ui-char-sleeps")" == $'0.003\n0.003' ]]
+    : > "$tmp/ui-char-sleeps"
+    _SM_SERIAL=0
+    _ui_write 'SSH中文' > "$tmp/ui-char-output"
+    [[ "$(cat "$tmp/ui-char-output")" == 'SSH中文' ]]
+    [[ ! -s "$tmp/ui-char-sleeps" ]]
+    _SM_SERIAL=1
+    _SM_SERIAL_CHAR_DELAY_MS=0
+    _ui_write 'no delay' > "$tmp/ui-char-output"
+    [[ ! -s "$tmp/ui-char-sleeps" ]]
+)
+done
+env -u SM_SERIAL_CHAR_DELAY_MS SM_NO_ENTRY=1 SM_SERIAL=1 bash -c 'source ./sm.sh; [[ "$_SM_SERIAL_CHAR_DELAY_MS" == 3 && "$_SM_SERIAL_CHAR_DELAY" == 0.003 ]]'
+SM_SERIAL_CHAR_DELAY_MS=invalid SM_NO_ENTRY=1 SM_SERIAL=1 bash -c 'source ./sm.sh; [[ "$_SM_SERIAL_CHAR_DELAY_MS" == 3 && "$_SM_SERIAL_CHAR_DELAY" == 0.003 ]]'
+SM_SERIAL_CHAR_DELAY_MS=5 SM_NO_ENTRY=1 SM_SERIAL=1 bash -c 'source ./sm.sh; [[ "$_SM_SERIAL_CHAR_DELAY_MS" == 5 && "$_SM_SERIAL_CHAR_DELAY" == 0.005 ]]'
+echo 'UTF-8 character pacing regression tests passed'

@@ -39,7 +39,7 @@
 # 改为各 action 内部显式 return/error 处理。
 set -uo pipefail
 
-SM_VERSION="1.6.3"
+SM_VERSION="1.6.4"
 
 # 配置默认值（可被环境变量覆盖）
 SM_CONF_DIR="${SM_CONF_DIR:-/etc/supervisor/conf.d}"
@@ -107,6 +107,13 @@ if [[ ! "$_SM_SERIAL_DELAY_MS" =~ ^[0-9]{1,4}$ ]] || (( 10#$_SM_SERIAL_DELAY_MS 
 fi
 _SM_SERIAL_DELAY_MS=$((10#$_SM_SERIAL_DELAY_MS))
 printf -v _SM_SERIAL_DELAY '%d.%03d' "$((_SM_SERIAL_DELAY_MS / 1000))" "$((_SM_SERIAL_DELAY_MS % 1000))"
+# Per-character pacing also applies when the line delay is set to zero.
+_SM_SERIAL_CHAR_DELAY_MS="${SM_SERIAL_CHAR_DELAY_MS:-3}"
+if [[ ! "$_SM_SERIAL_CHAR_DELAY_MS" =~ ^[0-9]{1,3}$ ]] || (( 10#$_SM_SERIAL_CHAR_DELAY_MS > 100 )); then
+    _SM_SERIAL_CHAR_DELAY_MS=3
+fi
+_SM_SERIAL_CHAR_DELAY_MS=$((10#$_SM_SERIAL_CHAR_DELAY_MS))
+printf -v _SM_SERIAL_CHAR_DELAY '%d.%03d' "$((_SM_SERIAL_CHAR_DELAY_MS / 1000))" "$((_SM_SERIAL_CHAR_DELAY_MS % 1000))"
 # ---------------------- 颜色 ----------------------
 if [[ -t 1 && "$_SM_SERIAL" == 0 && "${SM_COLOR:-1}" != 0 ]]; then
     C_RESET=$'\033[0m'; C_RED=$'\033[31m'; C_GREEN=$'\033[32m'; C_YELLOW=$'\033[33m'
@@ -379,20 +386,48 @@ _ui_delay() {
     return 0
 }
 
+# Pace complete UTF-8 code points, not individual bytes. Byte slicing in a
+# local C locale is independent of the guest's installed locale definitions.
+# Preserve the original bytes (including malformed input) rather than
+# rewriting user-provided paths or command output. No extra dependency.
+_ui_serial_chars() {
+    local LC_ALL=C
+    local text="$1" i=0 n byte len j next
+    n=${#text}
+    if (( _SM_SERIAL_CHAR_DELAY_MS == 0 )); then printf '%s' "$text"; return $?; fi
+    while (( i < n )); do
+        printf -v byte '%d' "'${text:i:1}"
+        len=1
+        if (( byte >= 0xC2 && byte <= 0xDF )); then len=2
+        elif (( byte >= 0xE0 && byte <= 0xEF )); then len=3
+        elif (( byte >= 0xF0 && byte <= 0xF4 )); then len=4
+        fi
+        if (( i + len > n )); then len=1; fi
+        for (( j=1; j<len; j++ )); do
+            printf -v next '%d' "'${text:i+j:1}"
+            if (( next < 0x80 || next > 0xBF )); then len=1; break; fi
+        done
+        printf '%s' "${text:i:len}" || return 1
+        sleep "$_SM_SERIAL_CHAR_DELAY" || true
+        i=$((i+len))
+    done
+    return 0
+}
+
 _ui_write() {
     local message="$1" line
-    if (( ! _SM_SERIAL || _SM_SERIAL_DELAY_MS == 0 )); then
+    if (( ! _SM_SERIAL || (_SM_SERIAL_DELAY_MS == 0 && _SM_SERIAL_CHAR_DELAY_MS == 0) )); then
         printf '%s' "$message"
         return $?
     fi
     while [[ "$message" == *$'\n'* ]]; do
         line="${message%%$'\n'*}"
-        printf '%s' "$line"$'\n' || return 1
+        _ui_serial_chars "$line"$'\n' || return 1
         _ui_delay
         message="${message#*$'\n'}"
     done
     if [[ -n "$message" ]]; then
-        printf '%s' "$message" || return 1
+        _ui_serial_chars "$message" || return 1
         _ui_delay
     fi
     return 0
@@ -413,7 +448,7 @@ _ui_printf() {
 }
 
 _ui_here() {
-    if (( ! _SM_SERIAL || _SM_SERIAL_DELAY_MS == 0 )); then cat; return $?; fi
+    if (( ! _SM_SERIAL || (_SM_SERIAL_DELAY_MS == 0 && _SM_SERIAL_CHAR_DELAY_MS == 0) )); then cat; return $?; fi
     local line
     while IFS= read -r line; do
         _ui_print "$line" || return 1
@@ -2288,7 +2323,7 @@ self_uninstall() (
 )
 usage() {
     if (( _SM_ENGLISH )); then
-        _ui_printf 'Supervisor Manager v%s\n  svm                  Interactive menu\n  svm --install        Install/upgrade\n  svm --uninstall      Remove manager only\n  svm -c status        Show status\n  svm --version         Version\n  SM_SERIAL=0 svm      Force normal interface\n  SM_SERIAL_DELAY_MS=150 svm  Serial UI delay (milliseconds; 0 disables)\n  SM_LANG=zh svm       Chinese interface\n  SM_PROFILE=package|mw|auto svm  Select profile (choose one)\n  SM_SUPERVISORD=/path SM_SUPERVISORCTL=/path SM_MAIN_CONF=/path svm\n' "$SM_VERSION"
+        _ui_printf 'Supervisor Manager v%s\n  svm                  Interactive menu\n  svm --install        Install/upgrade\n  svm --uninstall      Remove manager only\n  svm -c status        Show status\n  svm --version         Version\n  SM_SERIAL=0 svm      Force normal interface\n  SM_SERIAL_DELAY_MS=150 svm  Serial line delay (milliseconds; 0 disables)\n  SM_SERIAL_CHAR_DELAY_MS=3 svm  Serial character delay (milliseconds; 0 disables)\n  SM_LANG=zh svm       Chinese interface\n  SM_PROFILE=package|mw|auto svm  Select profile (choose one)\n  SM_SUPERVISORD=/path SM_SUPERVISORCTL=/path SM_MAIN_CONF=/path svm\n' "$SM_VERSION"
         return 0
     fi
     _ui_here <<EOF
@@ -2322,7 +2357,8 @@ ${C_BOLD}Supervisor Manager v$SM_VERSION${C_RESET}
   SM_BACKUP_DIR               编辑/删除前的自动备份目录
   SM_NO_CLEAR=1               禁用首页清屏（保留终端滚动历史）
   SM_SERIAL=1/0               强制开启/关闭串口简化显示（默认自动识别）
-  SM_SERIAL_DELAY_MS=150        串口界面每行/提示间隔毫秒（0-1000，0 关闭）
+  SM_SERIAL_DELAY_MS=150       串口界面每行/提示间隔毫秒（0-1000，0 关闭）
+  SM_SERIAL_CHAR_DELAY_MS=3    串口界面完整字符间隔毫秒（0-100，0 关闭）
   SM_LANG=zh/en               界面语言（默认中文，英文可选）
   SM_COLOR=0                  禁用颜色
   SM_LOCALE=0                 关闭 locale 自适应；SM_LOCALE=<name> 指定 UTF-8 locale
