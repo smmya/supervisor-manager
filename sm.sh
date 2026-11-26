@@ -1,0 +1,2090 @@
+#!/usr/bin/env bash
+# ============================================================================
+#  sm.sh - Supervisor Manager (interactive shell, menu-driven)
+#  参考 mdserver-web / 宝塔 supervisor 插件功能集，纯 bash 实现。
+#  覆盖：安装、开机自启、状态看板、增删改查、启停重启、日志、配置重载。
+#  v1.3.0：首页直接渲染进程状态看板（不再需要单独进"查看状态"）。
+#  v1.3.1：编辑配置加备份 + 改动检测 + 重载闭环；修复 reread 失败仍报"重载完成"。
+#  v1.3.2：配置定位改以主配置 [include] files 为准——修复 include 指向别处
+#          （如 RHEL 的 /etc/supervisord.d/*.ini）时"编辑/删除"列表全空的问题。
+#  v1.4.0：启动时自动切到 UTF-8 locale（应对 sudo 清空 LANG）；界面按"显示宽度"
+#          排版，中文表头、分隔线、日志前缀在任意 locale 下都对齐。
+# ============================================================================
+
+# 注意：交互式菜单工具不使用 set -e。原因：
+# 1. 子命令（supervisorctl）失败会让脚本意外退出，破坏菜单循环；
+# 2. ui_menu 用命令替换时，子 shell 内任何失败都会让 $() 返回空，触发死循环。
+# 改为各 action 内部显式 return/error 处理。
+set -uo pipefail
+
+SM_VERSION="1.4.0"
+
+# 配置默认值（可被环境变量覆盖）
+SM_CONF_DIR="${SM_CONF_DIR:-/etc/supervisor/conf.d}"
+SM_MAIN_CONF="${SM_MAIN_CONF:-/etc/supervisor/supervisord.conf}"
+SM_LOG_DIR="${SM_LOG_DIR:-/var/log/supervisor}"
+SM_RUN_DIR="${SM_RUN_DIR:-/var/run/supervisor}"
+# 编辑前的自动备份目录（宁可多占几 KB，也别让改坏配置变成不可逆事故）
+SM_BACKUP_DIR="${SM_BACKUP_DIR:-/var/backups/supervisor-manager}"
+# 界面总宽：标题线、分隔线、状态表都按这个值排版（终端常见 80 列，68 留有余量）
+# 未显式指定时默认 68，并在终端更窄时自动收窄（见 _fit_width），避免折行破坏对齐
+_SM_WIDTH_AUTO=0
+if [[ -z "${SM_WIDTH:-}" ]]; then
+    SM_WIDTH=68
+    _SM_WIDTH_AUTO=1
+fi
+# 状态表各列宽度（之和 + 缩进 2 + 列间距 6 = SM_WIDTH）
+_SM_W_NAME=26; _SM_W_STATE=11; _SM_W_PID=7; _SM_W_UP=16
+
+# ui_menu 选中值的全局变量（避免命令替换陷阱）
+_SM_MENU_CHOICE=""
+# locale 自适应后待显示的一次性提示（进菜单首屏时打印后清空）
+_SM_LOCALE_NOTE=""
+# 字节值查找表 + 宽度计算自检结果
+_SM_BYTES=""
+_SM_DW_OK=0
+_SM_TESTING=0
+_SM_PAD=""        # _pad_c / _rule 的输出落点（避免用 $( ) 取结果而 fork）
+
+# ---------------------- 颜色 ----------------------
+if [[ -t 1 ]]; then
+    C_RESET="\033[0m"; C_RED="\033[31m"; C_GREEN="\033[32m"; C_YELLOW="\033[33m"
+    C_BLUE="\033[34m"; C_CYAN="\033[36m"; C_GRAY="\033[90m"; C_BOLD="\033[1m"
+    C_BG_BLUE="\033[44m"
+else
+    C_RESET=""; C_RED=""; C_GREEN=""; C_YELLOW=""; C_BLUE=""
+    C_CYAN=""; C_GRAY=""; C_BOLD=""; C_BG_BLUE=""
+fi
+
+# ============================================================================
+#  显示宽度对齐（与系统 locale 无关）
+#
+#  为什么不能用 printf 的 %-Ns 给中文补齐——实测同一个 %-8s 作用于「名称」：
+#     LC_ALL=C            → 补 2 个空格（按字节，6 字节）
+#     LC_ALL=zh_CN.UTF-8  → 补 6 个空格（按字符，2 个字符）
+#     正确值              → 4 个空格（终端里占 4 列）
+#  也就是说没有任何 locale 能让 printf 自动对齐中文。唯一可靠的做法是按
+#  "终端显示宽度"手工补齐：CJK / 全角字符 2 列，其余 1 列，ANSI 转义 0 列。
+#
+#  实现刻意不依赖 locale：在 C locale 的子 shell 里逐字节还原码点，所以无论
+#  脚本跑在 C / C.UTF-8 / zh_CN.UTF-8，排版结果都一样。
+# ============================================================================
+
+# 字节值查找表：第 N 个字节的值就是 N（1..255），用于把单个字节还原成数值
+_sm_bytes_init() {
+    local fmt="" i o
+    for ((i = 1; i <= 255; i++)); do
+        printf -v o '%03o' "$i"
+        fmt+="\\$o"
+    done
+    _SM_BYTES=$(printf "$fmt")
+}
+
+# 取单个字节的数值，结果写入 _BV（不用 echo + $()，避免每个字节 fork 一次）
+_bv() {
+    local pre
+    pre="${_SM_BYTES%%"$1"*}"
+    _BV=$(( ${#pre} + 1 ))
+    (( _BV > 255 )) && _BV=0
+}
+
+# 按显示宽度右补空格；超宽则截断并以 .. 结尾。必须在 LC_ALL=C 下调用
+# 结果写入变量 _SM_PAD（不打印）：一次 $( ) 就是一次 fork，表格每行要补 4 格，
+# 走 stdout 的话几十个进程就是上百次 fork，慢的机器上首屏要等好几秒
+_pad_c() {
+    local s want i=0 n dw=0 pre ch b b1 b2 cp len wide j k acc out w
+    s="$1"; want="$2"; n=${#s}
+    # 自检未通过时退回普通 printf（行为与旧版一致，至少不会更糟）
+    # _SM_TESTING=1 时强制走完整算法——自检本身就是在这个标志下进行的，
+    # 否则自检测到的永远是回退路径的结果，宽度计算永远启用不了
+    if (( ! (_SM_DW_OK || _SM_TESTING) )); then
+        _SM_PAD="$s"
+        (( n < want )) && printf -v _SM_PAD '%s%*s' "$s" $((want - n)) ''
+        return 0
+    fi
+    local -a cs=() ws=()
+    while (( i < n )); do
+        ch="${s:i:1}"
+        pre="${_SM_BYTES%%"$ch"*}"; b=$(( ${#pre} + 1 )); (( b > 255 )) && b=0
+        # ANSI 转义序列：ESC [ ... 终止字节(0x40-0x7E)，整体 0 列
+        if (( b == 27 )); then
+            if [[ "${s:i+1:1}" == "[" ]]; then
+                j=$((i + 2))
+                while (( j < n )); do
+                    _bv "${s:j:1}"; j=$((j + 1))
+                    (( _BV >= 0x40 && _BV <= 0x7E )) && break
+                done
+            else
+                j=$((i + 2))
+            fi
+            cs+=("${s:i:j-i}"); ws+=(0); i=$j; continue
+        fi
+        # 控制字符、游离的续字节：0 列
+        if (( b < 0x20 || (b >= 0x80 && b < 0xC0) )); then
+            cs+=("$ch"); ws+=(0); i=$((i + 1)); continue
+        fi
+        # 由首字节判断字符长度，并还原 Unicode 码点
+        if (( b < 0x80 )); then
+            len=1; cp=$b
+        elif (( b < 0xE0 )); then
+            len=2; _bv "${s:i+1:1}"; b1=$_BV
+            cp=$(( ((b & 0x1F) << 6) | (b1 & 0x3F) ))
+        elif (( b < 0xF0 )); then
+            len=3; _bv "${s:i+1:1}"; b1=$_BV; _bv "${s:i+2:1}"; b2=$_BV
+            cp=$(( ((b & 0x0F) << 12) | ((b1 & 0x3F) << 6) | (b2 & 0x3F) ))
+        else
+            len=4; cp=0x20000       # 4 字节（emoji 等）一律按 2 列
+        fi
+        wide=0
+        # 注意：(( )) 内部不能写 # 注释——# 在算术上下文里是进制分隔符（如 16#ff），
+        # 写了就是语法错误，而且整段表达式静默失效
+        # 判定"占 2 列"的范围：
+        #   4 字节字符（emoji 等）、谚文字母 1100-115F、CJK 部首与标点 2E80-303E、
+        #   假名与兼容字符 3041-33FF、扩展 A 3400-4DBF、CJK 统一表意 4E00-9FFF、
+        #   彝文 A000-A4CF、谚文音节 AC00-D7A3、兼容表意 F900-FAFF、
+        #   竖排形式 FE10-FE19 / FE30-FE6F、全角 ASCII 与括号 FF00-FF60、FFE0-FFE6
+        if (( len == 4
+              || (cp >= 0x1100 && cp <= 0x115F)
+              || (cp >= 0x2E80 && cp <= 0x303E)
+              || (cp >= 0x3041 && cp <= 0x33FF)
+              || (cp >= 0x3400 && cp <= 0x4DBF)
+              || (cp >= 0x4E00 && cp <= 0x9FFF)
+              || (cp >= 0xA000 && cp <= 0xA4CF)
+              || (cp >= 0xAC00 && cp <= 0xD7A3)
+              || (cp >= 0xF900 && cp <= 0xFAFF)
+              || (cp >= 0xFE10 && cp <= 0xFE19)
+              || (cp >= 0xFE30 && cp <= 0xFE6F)
+              || (cp >= 0xFF00 && cp <= 0xFF60)
+              || (cp >= 0xFFE0 && cp <= 0xFFE6) )); then
+            wide=1
+        fi
+        # 不用 ws[-1]：负下标要 bash 4.3+，CentOS 7 的 4.2 会报 bad array subscript
+        w=$(( wide ? 2 : 1 ))
+        ws+=( "$w" )
+        dw=$((dw + w))
+        cs+=("${s:i:len}")
+        i=$((i + len))
+    done
+
+    if (( dw <= want )); then
+        _SM_PAD="$s"
+        (( dw < want )) && printf -v _SM_PAD '%s%*s' "$s" $((want - dw)) ''
+        return 0
+    fi
+    # 超宽截断：保留 want-2 列，结尾用 ASCII 的 ..（省略号 … 是"宽度不确定"字符，不能用）
+    acc=0; out=""
+    for k in "${!cs[@]}"; do
+        (( acc + ws[k] > want - 2 )) && break
+        out+="${cs[k]}"
+        acc=$((acc + ws[k]))
+    done
+    _SM_PAD="${out}.."
+}
+
+# 对外接口：在 C locale 的子 shell 里补齐并输出到 stdout，调用方无需关心当前 locale
+# 用法：_pad "文本" 宽度        直接输出（只在自检等少量场景用；批量渲染请用 _pad_c 读 _SM_PAD）
+_pad() {
+    ( LC_ALL=C; _pad_c "$@"; printf '%s' "$_SM_PAD" )
+}
+
+# 生成 n 个指定字符组成的横线（无 fork）
+# 生成 n 个指定字符组成的横线，结果写入 _SM_PAD（无 fork）
+_rule() {
+    local s
+    printf -v s '%*s' "$1" ''
+    _SM_PAD="${s// /${2:--}}"
+}
+
+# 启动时自检：任一用例不符就关闭宽度计算，退回旧行为
+_sm_width_selftest() {
+    local e=$'\033'
+    _SM_DW_OK=0
+    _SM_TESTING=1
+    [[ $( (LC_ALL=C; echo ${#_SM_BYTES}) ) -eq 255 ]] || return 1
+    [[ "$(_pad "中" 4)"              == "中  "                 ]] || return 1
+    [[ "$(_pad "名称" 8)"            == "名称    "             ]] || return 1
+    [[ "$(_pad "ab" 4)"              == "ab  "                 ]] || return 1
+    [[ "$(_pad "${e}[31m中${e}[0m" 4)" == "${e}[31m中${e}[0m  " ]] || { _SM_TESTING=0; return 1; }
+    [[ "$(_pad "一个很长很长的进程名字超过限制" 10)" == "一个很长.." ]] || { _SM_TESTING=0; return 1; }
+    _SM_TESTING=0
+    _SM_DW_OK=1
+}
+
+# 终端比默认宽度窄时收窄界面：只动"名称"列（最宽、也最适合被截断），
+# 其余三列装的是状态/PID/时长，再窄就放不下了。显式设置了 SM_WIDTH 则完全尊重用户。
+_fit_width() {
+    (( _SM_WIDTH_AUTO )) || return 0
+    local cols="${COLUMNS:-}"
+    # 非交互脚本里 COLUMNS 常常没有，退回 stty（stdin 是 tty 时才问得到）
+    if [[ -z "$cols" || "$cols" == "80" ]] && [[ -t 0 ]]; then
+        cols=$(stty size 2>/dev/null | awk '{print $2}')
+    fi
+    [[ "$cols" =~ ^[0-9]+$ ]] || return 0
+    (( cols >= SM_WIDTH )) && return 0
+    (( cols < 44 )) && cols=44          # 再窄就没有可读性可言了，保底 44
+    _SM_W_NAME=$(( _SM_W_NAME - (SM_WIDTH - cols) ))
+    ((_SM_W_NAME < 6)) && _SM_W_NAME=6
+    SM_WIDTH=$(( 2 + _SM_W_NAME + 2 + _SM_W_STATE + 2 + _SM_W_PID + 2 + _SM_W_UP ))
+    return 0
+}
+
+# ============================================================================
+#  locale 自适应
+#
+#  `sudo` 默认 env_reset 会清掉 LANG/LC_*，脚本于是跑在 C locale：bash 把一个
+#  汉字当成 3 个字节处理，`read` 读进来的中文也可能被切坏。进菜单前先探测，
+#  不是 UTF-8 就切到系统里可用的 UTF-8 locale。
+#
+#  能改的：本脚本进程及其子进程（bash / awk / vim / supervisorctl）的 locale。
+#  改不了的：终端软件自身的解码方式（Xshell、PuTTY 的"编码"是客户端设置），
+#           以及脚本退出后的父 shell。这两点只能靠提示。
+# ============================================================================
+
+# 用 bash 自己的字符计数判定：UTF-8 下「中」是 1 个字符，C locale 下是 3 个字节
+_locale_is_utf8() {
+    local probe="中"
+    (( ${#probe} == 1 ))
+}
+
+# 在子 shell 里试一个候选 locale 是否真的生效（不污染当前环境）
+_locale_works() {
+    # 子 shell 里赋值不会外泄，所以不用 local（local 在非函数上下文的子 shell 里会报错）
+    ( LC_ALL="$1"; p="中"; (( ${#p} == 1 )) ) 2>/dev/null
+}
+
+_ensure_utf8_locale() {
+    # SM_LOCALE=0 关闭自适应；SM_LOCALE=<name> 指定要用哪个 locale
+    local opt="${SM_LOCALE:-1}"
+    [[ "$opt" == "0" ]] && return 0
+    if [[ "$opt" == "1" ]] && _locale_is_utf8; then
+        return 0
+    fi
+
+    local -a cands=()
+    local c pick=""
+    [[ "$opt" != "1" ]] && cands+=("$opt")
+    # LANG 原本是非 UTF-8 的 locale（如 zh_CN.GBK）时，优先同语言的 UTF-8 变体。
+    # 注意判断要用完整的 LANG：先截掉编码再判断，会把 en_US.UTF-8 也误判成
+    # "非 UTF-8"，从而让 en_US.UTF-8 抢到 C.UTF-8 前面
+    if [[ -n "${LANG:-}" && "$LANG" != *[Uu][Tt][Ff]* ]]; then
+        local lang="${LANG%%[@.]*}"
+        [[ -n "$lang" ]] && cands+=("${lang}.UTF-8")
+    fi
+    cands+=(C.UTF-8 C.utf8 en_US.UTF-8 en_US.utf8 zh_CN.UTF-8)
+
+    for c in "${cands[@]}"; do
+        if _locale_works "$c"; then
+            pick="$c"; break
+        fi
+    done
+
+    local before="${LC_ALL:-${LC_CTYPE:-${LANG:-C}}}"
+    if [[ -z "$pick" ]]; then
+        # 系统里一个可用的 UTF-8 locale 都没有：只能提示用户安装
+        _SM_LOCALE_NOTE="  ${C_YELLOW}[WARN]${C_RESET}  系统中没有可用的 UTF-8 locale（当前: ${before}），中文可能显示异常\n${C_GRAY}        Debian/Ubuntu: apt install locales && dpkg-reconfigure locales\n        RHEL/CentOS:  localedef -c -f UTF-8 -i zh_CN zh_CN.UTF-8${C_RESET}"
+        return 1
+    fi
+
+    # 有 LC_ALL 时只能整体覆盖（它的优先级最高）；否则只动 LC_CTYPE，
+    # 这样消息语言等其他类别仍按用户原本的设置走，副作用最小
+    if [[ -n "${LC_ALL:-}" ]]; then
+        export LC_ALL="$pick"
+    else
+        export LC_CTYPE="$pick"
+    fi
+    if ! _locale_is_utf8; then
+        _SM_LOCALE_NOTE="  ${C_YELLOW}[WARN]${C_RESET}  已设置 locale=$pick 但未生效，中文可能显示异常"
+        return 1
+    fi
+
+    # 切换成功：告知一声。乱码的可能性来自终端软件而非 locale，所以再补一行英文
+    # 不写"因为 sudo"之类的原因推测：原 locale 非 UTF-8 可能是 sudo、ssh 未传 LANG、
+    # 或本来就没配，脚本无从判断，只陈述"从什么切到了什么"
+    _SM_LOCALE_NOTE="  ${C_GRAY}[INFO]${C_RESET}  locale ${before} -> ${pick}（原 locale 非 UTF-8，已自动切换）\n        If the text below looks garbled, set your terminal encoding to UTF-8.${C_RESET}"
+    return 0
+}
+
+# ============================================================================
+#  UI 工具函数
+# ============================================================================
+
+ui_line() {
+    local char="${1:--}"; local len="${2:-$SM_WIDTH}"
+    _rule "$len" "$char"; printf '%s\n' "$_SM_PAD"
+}
+
+ui_title() {
+    echo
+    echo -e "${C_BG_BLUE}${C_BOLD} $1 ${C_RESET}"
+    ui_line '='
+}
+
+# 四种前缀统一成 7 个字符，后面的正文才能左对齐
+ui_info()    { echo -e "${C_GREEN}[INFO]${C_RESET}  $*"; }
+ui_warn()    { echo -e "${C_YELLOW}[WARN]${C_RESET}  $*"; }
+ui_error()   { echo -e "${C_RED}[ERROR]${C_RESET} $*" >&2; }
+ui_success() { echo -e "${C_GREEN}${C_BOLD}[ OK ]${C_RESET}  $*"; }
+
+# ui_ask prompt [default] -> 输出到 stdout
+ui_ask() {
+    local prompt="$1" default="${2:-}" input p
+    if [[ -n "$default" ]]; then
+        printf -v p "${C_BOLD}%s${C_RESET} [%s]: " "$prompt" "$default"
+    else
+        printf -v p "${C_BOLD}%s${C_RESET}: " "$prompt"
+    fi
+    read -r -p "$(echo -e "$p")" input || return 1
+    if [[ -z "$input" && -n "$default" ]]; then echo "$default"
+    else echo "$input"; fi
+}
+
+# ui_confirm "提示" [y|n] -> 0=是 1=否
+ui_confirm() {
+    local prompt="${1:-确认?}"; local default="${2:-y}"; local input
+    while true; do
+        if [[ "$default" == "y" ]]; then
+            read -r -p "$(echo -e "${C_BOLD}${prompt}${C_RESET} [Y/n]: ")" input || return 1
+            input="${input:-y}"
+        else
+            read -r -p "$(echo -e "${C_BOLD}${prompt}${C_RESET} [y/N]: ")" input || return 1
+            input="${input:-n}"
+        fi
+        case "$input" in
+            y|Y|yes|YES) return 0 ;;
+            n|N|no|NO)    return 1 ;;
+            *) echo "  请输入 y 或 n" ;;
+        esac
+    done
+}
+
+ui_pause() {
+    echo
+    # 仅在 stdin 是 tty 时阻塞等用户按键，否则直接返回
+    if [ -t 0 ]; then
+        read -r -N 1 -s -p "$(echo -e "${C_GRAY}按任意键继续...${C_RESET}")" _ || true
+        echo
+    fi
+}
+
+# 带 EOF 保护的输入：read 失败（Ctrl+D）时返回 1，调用方应中止流程
+# 注意：提示信息必须走 stderr，否则会被调用方的 $(...) 捕获进变量
+_ask_or_abort() {
+    local val
+    val=$(ui_ask "$@") || {
+        echo >&2
+        ui_warn "输入已中断（EOF），本次操作取消" >&2
+        return 1
+    }
+    printf '%s' "$val"
+}
+
+# 把各种布尔写法统一为 supervisor 要求的 true/false
+# 支持: y/yes/true/1/on -> true；n/no/false/0/off/空 -> false
+_to_bool() {
+    case "$(printf '%s' "${1:-}" | tr '[:upper:]' '[:lower:]')" in
+        y|yes|true|1|on)  echo true ;;
+        *)                echo false ;;
+    esac
+}
+
+# 挑选编辑器：优先 $EDITOR；未设置则按常见编辑器探测
+_pick_editor() {
+    if [[ -n "${EDITOR:-}" ]]; then
+        printf '%s' "$EDITOR"; return 0
+    fi
+    local c
+    for c in vi vim nano emacs; do
+        if command -v "$c" >/dev/null 2>&1; then printf '%s' "$c"; return 0; fi
+    done
+    return 1
+}
+
+# 打开编辑器：兼容 EDITOR 含参数的情况（如 EDITOR="vim -u NONE"）
+# 返回编辑器退出码，找不到编辑器返回 127。
+# 注意：这里不调用 ui_pause —— 暂停交给调用方，否则会出现连按两次的尴尬
+_open_editor() {
+    local file="$1"
+    local ed
+    ed=$(_pick_editor) || {
+        ui_error "找不到编辑器（\$EDITOR / vi / vim / nano 均不可用）"
+        ui_info "装一个（如 apt install vim）或设置 EDITOR=/path/to/editor"
+        return 127
+    }
+    local -a ed_args
+    read -r -a ed_args <<< "$ed"
+    if [[ ${#ed_args[@]} -eq 0 ]]; then
+        ui_error "EDITOR 为空，无法打开编辑器"
+        return 127
+    fi
+    if ! command -v "${ed_args[0]}" >/dev/null 2>&1; then
+        ui_error "找不到编辑器: ${ed_args[0]}"
+        ui_info "可设置环境变量 EDITOR=vi（或 nano/vim）后重试"
+        return 127
+    fi
+    "${ed_args[@]}" "$file"
+}
+
+# ============================================================================
+#  配置文件定位
+#  supervisor 到底加载哪些文件，由主配置的 [include] files 决定，而不是由本脚本
+#  的 SM_CONF_DIR 决定。两者不一致时（典型：RHEL 系 files=/etc/supervisord.d/*.ini，
+#  或进程直接写在 supervisord.conf 里），按 SM_CONF_DIR 扫描会得到空列表，
+#  表现为"编辑进程配置什么也不显示"。以下函数统一以 include 为准。
+# ============================================================================
+
+# 提取主配置 [include] 段的 files 值（支持多行续行、空格分隔多个 glob）
+_conf_include_patterns() {
+    local main="${1:-$SM_MAIN_CONF}"
+    [[ -f "$main" ]] || return 1
+    awk '
+        /^[[:space:]]*\[/ {
+            ininc = ($0 ~ /^[[:space:]]*\[include\][[:space:]]*$/)
+            join = 0
+            next
+        }
+        ininc && /^[[:space:]]*files[[:space:]]*=/ {
+            v = $0
+            sub(/^[[:space:]]*files[[:space:]]*=[[:space:]]*/, "", v)
+            print v
+            join = 1
+            next
+        }
+        ininc && join && /^[[:space:]]+[^[:space:]]/ {
+            print $0
+            next
+        }
+        { join = 0 }
+    ' "$main" 2>/dev/null
+}
+
+# 把 include 的 glob 展开成实际存在的文件；相对路径按主配置所在目录解析
+_conf_include_files() {
+    local main="${SM_MAIN_CONF}"
+    [[ -f "$main" ]] || return 1
+    local maindir; maindir=$(dirname "$main")
+    local line tok f
+    local -a pats=()
+    while IFS= read -r line; do
+        [[ -z "${line//[[:space:]]/}" ]] && continue
+        for tok in $line; do
+            case "$tok" in
+                ';'*|'#'*) continue ;;
+            esac
+            # Python ConfigParser 注释也允许行内 ; 之后的内容
+            tok="${tok%%;*}"
+            [[ -z "$tok" ]] && continue
+            [[ "$tok" == /* ]] || tok="$maindir/$tok"
+            pats+=("$tok")
+        done
+    done < <(_conf_include_patterns "$main")
+
+    (( ${#pats[@]} )) || return 1
+    local p
+    for p in "${pats[@]}"; do
+        while IFS= read -r f; do
+            [[ -n "$f" && -f "$f" ]] && printf '%s\n' "$f"
+        done < <(compgen -G "$p" 2>/dev/null)
+    done
+}
+
+# 本机所有会被 supervisord 加载的进程配置文件
+# 优先 include；解析不到时退回常见默认位置（老部署 / 主配置缺失）
+_conf_source_files() {
+    local f found=0
+    while IFS= read -r f; do
+        [[ -n "$f" ]] && { printf '%s\n' "$f"; found=1; }
+    done < <(_conf_include_files)
+    (( found == 1 )) && return 0
+
+    for f in "$SM_CONF_DIR"/*.conf "$SM_CONF_DIR"/*.ini \
+             /etc/supervisord.d/*.conf /etc/supervisord.d/*.ini \
+             /etc/supervisor/conf.d/*.conf /etc/supervisor/conf.d/*.ini; do
+        [[ -f "$f" && "$f" != "$SM_MAIN_CONF" ]] && printf '%s\n' "$f"
+    done
+}
+
+# 计算「添加守护进程」的落点：目录 + 扩展名
+# 结果写入全局 _SM_TARGET_DIR / _SM_TARGET_EXT
+# 依据 include 里第一个可用的 glob，例如 files=/etc/supervisord.d/*.ini
+#   → 目录 /etc/supervisord.d，后缀 .ini
+# 关键：后缀也必须对齐。只把目录改对、仍写 .conf 的话，在 *.ini 的机器上
+# 文件永远不会被加载，表现为"添加成功但进程一直不出现"
+_preferred_conf_target() {
+    local main="$SM_MAIN_CONF"
+    local maindir; maindir=$(dirname "$main")
+    local line tok base ext d tail_part
+    _SM_TARGET_DIR="$SM_CONF_DIR"
+    _SM_TARGET_EXT=".conf"
+    while IFS= read -r line; do
+        for tok in $line; do
+            case "$tok" in ';'*|'#'*) continue ;; esac
+            tok="${tok%%;*}"
+            [[ -z "$tok" ]] && continue
+            [[ "$tok" == /* ]] || tok="$maindir/$tok"
+            d="${tok%/*}"
+            [[ -d "$d" ]] || continue
+            base="${tok##*/}"
+            ext=""
+            if [[ "$base" == *.* ]]; then
+                tail_part="${base##*.}"
+                # 后缀部分带通配符时不可用（如 "*" 本身）
+                [[ "$tail_part" != *"*"* && "$tail_part" != *"?"* ]] && ext=".$tail_part"
+            fi
+            _SM_TARGET_DIR="$d"
+            _SM_TARGET_EXT="$ext"
+            return 0
+        done
+    done < <(_conf_include_patterns "$main")
+    return 0
+}
+
+# 某个 [program:name] 是否已被任何被加载的配置定义
+_program_exists() {
+    local name="$1" f
+    while IFS= read -r f; do
+        [[ -n "$f" && -f "$f" ]] || continue
+        if awk -v sec="[program:${name}]" '
+            /^\[/ { if ($0 == sec) { found = 1; exit } }
+            END { exit(found ? 0 : 1) }
+        ' "$f" 2>/dev/null; then
+            return 0
+        fi
+    done < <( { _conf_source_files; [[ -f "$SM_MAIN_CONF" ]] && printf '%s\n' "$SM_MAIN_CONF"; } )
+    return 1
+}
+
+# 从配置文件中解析指定进程的某个键值（支持 numprocs 实例 name:N 与组汇总 name:*）
+# 用法: _lookup_key <进程名> <键名>
+_lookup_key() {
+    local proc_name="$1" key="$2"
+    # numprocs 实例 / 组汇总：worker:0、group:* → 找 [program:worker] / [program:...]
+    local search_name="$proc_name"
+    [[ "$search_name" == *:* ]] && search_name="${search_name%%:*}"
+
+    local -a files=()
+    local f
+    while IFS= read -r f; do [[ -n "$f" ]] && files+=("$f"); done < <(_conf_source_files)
+    # 进程也可能直接定义在主配置里
+    [[ -f "$SM_MAIN_CONF" ]] && files+=("$SM_MAIN_CONF")
+    [[ ${#files[@]} -eq 0 ]] && { printf ''; return 0; }
+
+    local file
+    file=$(awk -v k="$key" -v sec="[program:${search_name}]" '
+        /^\[/ { insec = ($0 == sec) }
+        insec && index($0, k "=") == 1 { sub(/^[^=]*=/, ""); print; exit }
+    ' "${files[@]}" 2>/dev/null)
+
+    # 去除首尾空白
+    file="${file#"${file%%[![:space:]]*}"}"
+    file="${file%"${file##*[![:space:]]}"}"
+    printf '%s' "$file"
+}
+
+# ui_menu "标题" "选项1" "选项2" ...
+# ui_menu --bare "标题" "选项1" ...   → 跳过标题渲染（用于调用方已自绘表头，如首页看板）
+# 选中索引写入 _SM_MENU_CHOICE（0 表示返回），返回 0
+# EOF 返回 1
+ui_menu() {
+    local bare=0
+    local zero_label="返回"
+    # 选项前置开关：--bare 只画分隔线（首页看板模式）；--zero 自定义 0 号项文案
+    while [[ $# -gt 0 ]]; do
+        case "${1:-}" in
+            --bare) bare=1; shift ;;
+            --zero) zero_label="${2:-返回}"; shift 2 ;;
+            *) break ;;
+        esac
+    done
+    local title="${1:-}"; shift || true
+    local options=("$@")
+    while true; do
+        if (( bare == 0 )); then
+            ui_title "$title"
+        else
+            # bare 模式只画一条分隔线，把菜单与上方看板隔开
+            ui_line '-' 
+        fi
+        local i=1
+        for opt in "${options[@]}"; do
+            printf "  ${C_CYAN}%2d${C_RESET}) %s\n" "$i" "$opt"
+            ((i++))
+        done
+        echo -e "  ${C_GRAY}0) ${zero_label}${C_RESET}"
+        echo
+        local choice=""
+        read -r -p "$(echo -e "${C_BOLD}请选择${C_RESET} [0-${#options[@]}]: ")" choice || return 1
+        # 去除空白（用户可能多按空格）
+        choice="${choice// /}"
+        # 直接回车 = 不选择，静默重绘（不报错，避免误触时噪音）
+        if [[ -z "$choice" ]]; then
+            continue
+        fi
+        if ! [[ "$choice" =~ ^[0-9]+$ ]]; then
+            ui_error "请输入数字"
+            continue
+        fi
+        # 强制十进制，避免 "08" 被 (( )) / [[ -eq ]] 当作非法八进制
+        choice=$((10#$choice))
+        if (( choice < 0 || choice > ${#options[@]} )); then
+            ui_error "超出范围 [0-${#options[@]}]"
+            continue
+        fi
+        _SM_MENU_CHOICE="$choice"
+        return 0
+    done
+}
+
+# ============================================================================
+#  系统检测
+# ============================================================================
+
+detect_pkgmgr() {
+    if command -v apt-get >/dev/null 2>&1; then echo apt
+    elif command -v dnf >/dev/null 2>&1; then echo dnf
+    elif command -v yum >/dev/null 2>&1; then echo yum
+    elif command -v apk >/dev/null 2>&1; then echo apk
+    elif command -v pacman >/dev/null 2>&1; then echo pacman
+    else echo unknown; fi
+}
+
+detect_init() {
+    if [[ -d /run/systemd/system ]]; then echo systemd
+    elif command -v rc-update >/dev/null 2>&1; then echo openrc
+    else echo unknown; fi
+}
+
+is_root() { [[ "${EUID:-$(id -u)}" -eq 0 ]]; }
+
+require_root() {
+    if ! is_root; then
+        ui_error "此操作需要 root 权限，请使用 sudo 或切换到 root"
+        ui_pause; return 1
+    fi
+    return 0
+}
+
+has_supervisord() { command -v supervisord >/dev/null 2>&1; }
+
+# 判断 supervisord 是否可连通（socket 是否响应）
+# 关键：不能用 supervisorctl status —— 任一进程非 RUNNING（FATAL/STOPPED/EXITED/STARTING）
+# 时它返回退出码 3，会把"有异常进程"误判成"supervisord 未运行"。
+# supervisorctl pid 才是可靠的存活探测：socket 通就返回 supervisord 的 PID 且退出 0。
+supervisor_alive() {
+    has_supervisord || return 1
+    supervisorctl pid >/dev/null 2>&1
+}
+
+# 检测失败原因：区分"未启动"与"无权限访问 socket"
+_supervisor_diag() {
+    local err
+    err=$(supervisorctl pid 2>&1 >/dev/null)
+    if [[ "$err" == *"no such file"* || "$err" == *"refused"* || "$err" == *"不"* ]]; then
+        echo "not_running"
+    elif [[ "$err" == *"permission"* || "$err" == *"Permission"* || "$err" == *"EACCES"* || "$err" == *"denied"* ]]; then
+        echo "no_permission"
+    else
+        echo "unknown"
+    fi
+}
+
+# 统一的"supervisord 不可用"提示，按真实原因给出可操作建议
+_report_not_alive() {
+    local diag; diag=$(_supervisor_diag)
+    case "$diag" in
+        no_permission)
+            ui_error "无权访问 supervisord socket（supervisord 可能正在运行）"
+            ui_info "请用 sudo 运行本工具，或检查主配置 [unix_http_server] chmod 设置"
+            ;;
+        not_running)
+            ui_error "supervisord 未运行"
+            ui_info "请执行菜单 [2] 启动并配置开机自启"
+            ;;
+        *)
+            ui_error "无法连接 supervisord"
+            ui_info "排查: systemctl status supervisor / journalctl -u supervisor"
+            ui_info "确认主配置 [supervisorctl] serverurl 与实际 socket 路径一致"
+            ;;
+    esac
+}
+
+# ============================================================================
+#  模块: 安装
+# ============================================================================
+
+action_install() {
+    require_root || return 1
+    ui_title "安装 Supervisor"
+
+    if has_supervisord; then
+        ui_warn "已检测到 supervisord: $(supervisord --version 2>/dev/null | head -1)"
+        if ! ui_confirm "是否重新安装/覆盖?" "n"; then return 0; fi
+    fi
+
+    local pkgmgr; pkgmgr=$(detect_pkgmgr)
+    case "$pkgmgr" in
+        apt)
+            ui_info "使用 apt-get 安装..."
+            apt-get update -y
+            DEBIAN_FRONTEND=noninteractive apt-get install -y supervisor
+            ;;
+        yum)
+            ui_info "使用 yum 安装（先装 EPEL）..."
+            yum install -y epel-release
+            yum install -y supervisor
+            ;;
+        dnf)
+            ui_info "使用 dnf 安装（先装 EPEL）..."
+            dnf install -y epel-release
+            dnf install -y supervisor
+            ;;
+        apk)
+            ui_info "使用 apk 安装..."
+            apk add --no-cache supervisor
+            ;;
+        pacman)
+            ui_info "使用 pacman 安装..."
+            pacman -S --noconfirm supervisor
+            ;;
+        unknown)
+            ui_error "无法识别包管理器，请手动安装 supervisor 后重试"
+            ui_info "可选: pip install supervisor （但需自建 systemd unit）"
+            ui_pause; return 1
+            ;;
+    esac
+
+    if ! has_supervisord; then
+        ui_error "安装命令执行完毕但 supervisord 不可用，请检查输出"
+        ui_pause; return 1
+    fi
+    ui_success "supervisor 已安装: $(supervisord --version 2>/dev/null | head -1)"
+
+    mkdir -p "$SM_CONF_DIR" "$SM_LOG_DIR" "$SM_RUN_DIR"
+
+    if [[ ! -f "$SM_MAIN_CONF" ]]; then
+        ui_info "生成主配置: $SM_MAIN_CONF"
+        if command -v echo_supervisord_conf >/dev/null 2>&1; then
+            echo_supervisord_conf > "$SM_MAIN_CONF" 2>/dev/null || true
+        fi
+        # 兜底：echo_supervisord_conf 不存在（部分安装包不带）时手写最小可用配置
+        if [[ ! -s "$SM_MAIN_CONF" ]]; then
+            ui_warn "echo_supervisord_conf 不可用或输出为空，生成最小可用配置"
+            cat > "$SM_MAIN_CONF" <<EOF
+[unix_http_server]
+file=$SM_RUN_DIR/supervisor.sock
+chmod=0700
+
+[supervisord]
+logfile=$SM_LOG_DIR/supervisord.log
+pidfile=$SM_RUN_DIR/supervisord.pid
+childlogdir=$SM_LOG_DIR
+
+[rpcinterface:supervisor]
+supervisor.rpcinterface_factory = supervisor.rpcinterface:make_main_rpcinterface
+
+[supervisorctl]
+serverurl=unix://$SM_RUN_DIR/supervisor.sock
+
+[include]
+files = $SM_CONF_DIR/*.conf
+EOF
+        fi
+    fi
+
+    # [include] 段存在不代表包含我们的目录，需检查 files 是否覆盖 SM_CONF_DIR
+    if ! grep -q "^\[include\]" "$SM_MAIN_CONF" 2>/dev/null; then
+        ui_info "追加 [include] 段引入 $SM_CONF_DIR/*.conf"
+        cat >> "$SM_MAIN_CONF" <<EOF
+
+[include]
+files = $SM_CONF_DIR/*.conf
+EOF
+    elif ! awk '/^\[include\]/{f=1;next} /^\[/{f=0} f && /^[[:space:]]*files[[:space:]]*=/ {print}' "$SM_MAIN_CONF" 2>/dev/null | grep -q "$SM_CONF_DIR"; then
+        # 注意：不能追加第二个 [include] 段——ConfigParser 会报 section 重复，
+        # 导致 supervisord 无法启动。这里只提示，由用户手工合并到已有 files 行。
+        ui_warn "主配置已有 [include] 段，但 files 未覆盖 $SM_CONF_DIR"
+        ui_info "当前 include 配置:"
+        awk '/^\[include\]/{f=1;next} /^\[/{f=0} f && NF' "$SM_MAIN_CONF" 2>/dev/null | sed 's/^/    /'
+        echo
+        ui_info "请手动在 [include] 的 files 行追加（用空格或续行分隔）:"
+        echo "    $SM_CONF_DIR/*.conf"
+        ui_warn "未处理前，菜单 [3] 添加的进程不会被 supervisord 加载"
+    fi
+
+    ui_info "目录结构:"
+    echo "  主配置:        $SM_MAIN_CONF"
+    echo "  子进程配置目录: $SM_CONF_DIR"
+    echo "  日志目录:      $SM_LOG_DIR"
+    echo "  PID/Run 目录:  $SM_RUN_DIR"
+
+    ui_pause
+}
+
+# ============================================================================
+#  模块: 开机自启
+# ============================================================================
+
+action_boot() {
+    require_root || return 1
+    ui_title "配置开机自启"
+
+    if ! has_supervisord; then
+        ui_error "尚未安装 supervisor，请先执行菜单 [1]"
+        ui_pause; return 1
+    fi
+
+    local init; init=$(detect_init)
+    case "$init" in
+        systemd)
+            # 用 systemctl cat 探测真实 unit 名，覆盖 /lib、/usr/lib、/etc 各发行版差异
+            local svc_name=""
+            local cand
+            for cand in supervisor supervisord; do
+                if systemctl cat "$cand" >/dev/null 2>&1; then
+                    svc_name="$cand"
+                    break
+                fi
+            done
+
+            if [[ -z "$svc_name" ]]; then
+                local sup_bin ctl_bin
+                sup_bin=$(command -v supervisord)
+                ctl_bin=$(command -v supervisorctl)
+                if [[ -z "$sup_bin" || -z "$ctl_bin" ]]; then
+                    ui_error "无法定位 supervisord/supervisorctl 可执行文件路径，无法生成 unit"
+                    ui_pause; return 1
+                fi
+                ui_warn "未找到现成 systemd unit，自动生成: /etc/systemd/system/supervisor.service"
+                cat > /etc/systemd/system/supervisor.service <<EOF
+[Unit]
+Description=Process Monitoring and Control Daemon (Supervisor)
+After=network.target
+
+[Service]
+Type=simple
+ExecStart=$sup_bin -n -c $SM_MAIN_CONF
+ExecStop=$ctl_bin shutdown
+KillMode=process
+Restart=on-failure
+RestartSec=3
+
+[Install]
+WantedBy=multi-user.target
+EOF
+                systemctl daemon-reload
+                svc_name=supervisor
+            fi
+
+            local cur_state=disabled cur_active=inactive
+            systemctl is-enabled "$svc_name" >/dev/null 2>&1 && cur_state=enabled
+            systemctl is-active "$svc_name"  >/dev/null 2>&1 && cur_active=active
+
+            echo "  服务名:       $svc_name"
+            echo "  开机自启:     $cur_state"
+            echo "  运行状态:     $cur_active"
+            echo
+
+            if [[ "$cur_state" == "enabled" && "$cur_active" == "active" ]]; then
+                ui_success "已开启开机自启且正在运行"
+                if ui_confirm "是否禁用开机自启并停止?" "n"; then
+                    systemctl disable --now "$svc_name" \
+                        && ui_warn "已禁用并停止" \
+                        || ui_error "禁用失败，请检查 systemctl 输出"
+                fi
+            else
+                if ui_confirm "是否启用开机自启并立即启动?"; then
+                    if ! systemctl enable --now "$svc_name"; then
+                        ui_error "systemctl enable 失败"
+                        ui_info "手动排查: systemctl status $svc_name"
+                        ui_pause; return 1
+                    fi
+                    # 服务启动是异步的，轮询等待而不是立刻判定失败
+                    local waited=0
+                    while (( waited < 50 )); do
+                        if systemctl is-active "$svc_name" >/dev/null 2>&1; then
+                            break
+                        fi
+                        # 若已进入 failed 状态则提前退出
+                        if systemctl is-failed "$svc_name" >/dev/null 2>&1; then
+                            break
+                        fi
+                        sleep 0.2
+                        ((waited++))
+                    done
+
+                    if systemctl is-active "$svc_name" >/dev/null 2>&1; then
+                        ui_success "已启用并运行"
+                        if supervisor_alive; then
+                            ui_info "supervisorctl 连通性检查: 正常"
+                        else
+                            ui_warn "服务已启动但 supervisorctl 无法连通"
+                            _report_not_alive
+                        fi
+                    else
+                        ui_error "已 enable 但启动失败"
+                        ui_info "排查命令:"
+                        echo "    systemctl status $svc_name --no-pager -l"
+                        echo "    journalctl -u $svc_name -n 50 --no-pager"
+                        echo "    supervisord -n -c $SM_MAIN_CONF   # 前台试跑看报错"
+                    fi
+                fi
+            fi
+            ;;
+        openrc)
+            ui_info "检测到 OpenRC"
+            rc-update add supervisor default 2>/dev/null || rc-update add supervisord default 2>/dev/null || {
+                ui_error "OpenRC 添加开机自启失败，请手动执行 rc-update add supervisor default"
+                ui_pause; return 1
+            }
+            ui_success "已加入 default 运行级"
+            ;;
+        *)
+            ui_error "无法识别 init 系统，建议手动写 /etc/rc.local 或 cron @reboot"
+            ui_pause; return 1
+            ;;
+    esac
+    ui_pause
+}
+
+# ============================================================================
+#  模块: 状态
+# ============================================================================
+
+_list_proc_names() {
+    if ! supervisor_alive; then return 0; fi
+    # 原样列出第一列：包括 numprocs 实例（name:0/name:1）与组汇总（group:*）
+    # supervisorctl 原生支持这些语法，无需也不能过滤
+    supervisorctl status 2>/dev/null | awk 'NF {print $1}'
+}
+
+# 读取状态原始输出（首页每轮菜单都会调用）
+# 加 5 秒超时上限：socket 卡死时不会把整个菜单拖住；没有 timeout 命令则退化为直接调用
+_supervisor_status_raw() {
+    if command -v timeout >/dev/null 2>&1; then
+        timeout 5 supervisorctl status 2>/dev/null
+    else
+        supervisorctl status 2>/dev/null
+    fi
+}
+
+# 渲染进程状态表格（首页看板与独立查看共用）
+# 返回 0=正常, 1=supervisord 不可用, 2=无受管进程
+_render_status_table() {
+    if ! has_supervisord; then
+        echo -e "  ${C_YELLOW}supervisord 未安装${C_RESET}  → 请选择 [1] 安装"
+        return 1
+    fi
+    if ! supervisor_alive; then
+        local diag; diag=$(_supervisor_diag)
+        if [[ "$diag" == "no_permission" ]]; then
+            echo -e "  ${C_RED}无权访问 supervisord socket${C_RESET}  → 请用 sudo 运行"
+        else
+            echo -e "  ${C_RED}supervisord 未运行${C_RESET}  → 请选择 [2] 启动并配置开机自启"
+        fi
+        return 1
+    fi
+
+    local raw rc
+    raw=$(_supervisor_status_raw); rc=$?
+    # 124 = timeout 主动超时；此时 raw 为空，不能误报"暂无受管进程"
+    # 注意：supervisorctl status 在有异常进程时本身返回 3，属正常，不能当错误处理
+    if (( rc == 124 )); then
+        echo -e "  ${C_RED}状态查询超时（supervisord 可能卡死）${C_RESET}  → 检查 $SM_LOG_DIR/supervisord.log"
+        return 1
+    fi
+    if [[ -z "$raw" ]]; then
+        echo -e "  ${C_GRAY}（暂无受管进程，选择 [3] 添加）${C_RESET}"
+        return 2
+    fi
+
+    ( LC_ALL=C; _render_status_body "$raw" )
+    return 0
+}
+
+# 状态表主体。必须在 LC_ALL=C 的子 shell 里调用——_pad_c 逐字节算显示宽度，
+# 依赖 C locale 的字节语义；放在同一个子 shell 里还避免了每格 fork 一次。
+#
+# supervisorctl status 的列不固定，按状态分支解析：
+#   name RUNNING   pid 12345, uptime 0:10:23
+#   name RUNNING   pid 12345, uptime 1 day, 2:03:04
+#   name FATAL     Exited too quickly (process log may have details)
+#   name STOPPED   Sep 12 03:04 PM
+#   name STARTING
+_render_status_body() {
+    local raw="$1"
+    local line _n _st rest name state pid uptime color summary
+    local total=0 running=0
+    local -a lines=()
+    while IFS= read -r line; do
+        [[ -z "${line//[[:space:]]/}" ]] && continue
+        lines+=("$line")
+        total=$((total + 1))
+        read -r _n _st _ <<< "$line"
+        [[ "$_st" == "RUNNING" ]] && running=$((running + 1))
+    done <<< "$raw"
+
+    # 颜色：C_* 里存的是字面量 "\033"，给 printf %s 用之前要换成真正的 ESC
+    local E=$'\033' R G Y RD GY
+    R="${C_RESET//\\033/$E}";  G="${C_GREEN//\\033/$E}"
+    Y="${C_YELLOW//\\033/$E}"; RD="${C_RED//\\033/$E}"
+    GY="${C_GRAY//\\033/$E}"
+
+    if (( running == total )); then
+        summary="共 ${total} 个，${G}全部运行中${R}"
+    else
+        summary="共 ${total} 个，${G}运行 ${running}${R}，${RD}异常 $((total - running))${R}"
+    fi
+    # 整个函数已在 LC_ALL=C 子 shell 里，直接调 _pad_c 读 _SM_PAD，不走 $( )（每行省 3 次 fork）
+    local p1 p2 p3
+    _pad_c "进程状态" 10; printf '  %s%s\n' "$_SM_PAD" "$summary"
+
+    _pad_c "名称" "$_SM_W_NAME";  p1=$_SM_PAD
+    _pad_c "状态" "$_SM_W_STATE"; p2=$_SM_PAD
+    _pad_c "PID"  "$_SM_W_PID";   p3=$_SM_PAD
+    printf '  %s  %s  %s  %s\n' "$p1" "$p2" "$p3" "运行时长"
+    _rule "$_SM_W_NAME";  p1=$_SM_PAD
+    _rule "$_SM_W_STATE"; p2=$_SM_PAD
+    _rule "$_SM_W_PID";   p3=$_SM_PAD
+    _rule "$_SM_W_UP"
+    printf '  %s  %s  %s  %s\n' "$p1" "$p2" "$p3" "$_SM_PAD"
+
+    for line in "${lines[@]}"; do
+        read -r name state rest <<< "$line"
+        rest="${rest#"${rest%%[![:space:]]*}"}"
+        pid="-"; uptime="-"
+        if [[ "$state" == "RUNNING" && "$rest" == "pid "* ]]; then
+            # rest = "pid 101, uptime 0:10:23" / "pid 102, uptime 1 day, 2:03:04"
+            # rest 的字段：1=pid 2=<PID>, 3=uptime 4...=<时长>
+            set -- $rest
+            pid="${2:-}"; pid="${pid%,}"
+            [[ -z "$pid" ]] && pid="-"
+            uptime="${*:4}"
+            # "1 day, 2:03:04" / "26 days, 3:04:05" 压成 "1d 2:03:04" / "26d 3:04:05"，
+            # 最长 "365d 23:59:59" 也能放进 16 列（原样 "365 days, 23:59:59" 会撑出表格）
+            uptime="${uptime// days, /d }"
+            uptime="${uptime// day, /d }"
+        else
+            [[ -n "$rest" ]] && uptime="$rest"
+        fi
+
+        case "$state" in
+            RUNNING)                              color="$G" ;;
+            FATAL|STOPPED)                        color="$RD" ;;
+            STARTING|STOPPING|BACKOFF)            color="$Y" ;;
+            *)                                    color="$GY" ;;
+        esac
+        _pad_c "$name"  "$_SM_W_NAME";  p1=$_SM_PAD
+        _pad_c "$state" "$_SM_W_STATE"; p2=$_SM_PAD
+        _pad_c "$pid"   "$_SM_W_PID";   p3=$_SM_PAD
+        printf '  %s  %s%s%s  %s  %s\n' "$p1" "$color" "$p2" "$R" "$p3" "$uptime"
+    done
+}
+
+# 清屏（仅 tty 下生效；SM_NO_CLEAR=1 可禁用，便于保留滚动历史）
+_clear_screen() {
+    if [[ "${SM_NO_CLEAR:-0}" != "1" ]] && [[ -t 1 ]]; then
+        printf '\033[2J\033[H'
+    fi
+}
+
+# 独立的"查看状态"屏（首页已自带看板，交互菜单不再用它）
+# 保留原因：source 加载本脚本（SM_NO_ENTRY=1）后，其他脚本可直接调用它打印带标题的状态屏
+action_status() {
+    ui_title "进程状态"
+    _render_status_table
+    ui_pause
+}
+
+
+# ============================================================================
+#  模块: 添加守护进程
+# ============================================================================
+
+action_add() {
+    require_root || return 1
+    ui_title "添加守护进程"
+
+    if ! has_supervisord; then
+        ui_error "尚未安装 supervisor"
+        ui_pause; return 1
+    fi
+
+    echo -e "${C_GRAY}按提示逐步填写，留空使用默认值。Ctrl+C 取消。${C_RESET}"
+    echo
+
+    local name command user directory autostart autorestart stdout_log stderr_log priority env_str
+
+    # 所有后续输入统一做 EOF 保护：任一 read 失败立即中止，避免写出空字段配置
+    name=$(_ask_or_abort "进程名称(英文，作为program段名)") || { ui_pause; return 0; }
+
+    if [[ -z "$name" ]]; then
+        ui_error "名称不能为空"
+        ui_pause; return 1
+    fi
+    # 进程名会成为 [program:x] 段名，必须符合 supervisor 命名规则
+    if ! [[ "$name" =~ ^[A-Za-z0-9_.-]+$ ]]; then
+        ui_error "名称只能包含字母、数字、下划线、点、连字符（不含空格/斜杠/冒号）"
+        ui_info "示例: myapp / web_api / worker-01"
+        ui_pause; return 1
+    fi
+    # 写入位置必须以 include 为准：目录和后缀都要对，否则 supervisord 永远不会加载
+    _preferred_conf_target
+    local conf_dir="$_SM_TARGET_DIR"
+    local target="$conf_dir/$name$_SM_TARGET_EXT"
+    if _program_exists "$name"; then
+        ui_error "已存在同名进程 [program:$name]，请改用菜单 [8] 编辑"
+        ui_pause; return 1
+    fi
+
+    command=$(_ask_or_abort "启动命令" "/usr/local/bin/$name") || { ui_pause; return 0; }
+    user=$(_ask_or_abort "运行用户" "root") || { ui_pause; return 0; }
+    directory=$(_ask_or_abort "工作目录" "/") || { ui_pause; return 0; }
+    autostart=$(_ask_or_abort "随supervisor启动(y/n)" "y") || { ui_pause; return 0; }
+    autorestart=$(_ask_or_abort "崩溃自动重启(y/n)" "y") || { ui_pause; return 0; }
+    priority=$(_ask_or_abort "启动优先级(数字越小越早)" "999") || { ui_pause; return 0; }
+    stdout_log=$(_ask_or_abort "stdout日志路径" "$SM_LOG_DIR/$name.log") || { ui_pause; return 0; }
+    stderr_log=$(_ask_or_abort "stderr日志路径" "$SM_LOG_DIR/$name-error.log") || { ui_pause; return 0; }
+    env_str=$(_ask_or_abort "环境变量(KEY1=val1,KEY2=val2 可空)" "") || { ui_pause; return 0; }
+
+    # command 是必填项，空配置会让进程直接 FATAL
+    if [[ -z "$command" ]]; then
+        ui_error "启动命令不能为空"
+        ui_pause; return 1
+    fi
+    # 优先级必须是非负整数
+    if ! [[ "$priority" =~ ^[0-9]+$ ]]; then
+        ui_warn "优先级 '$priority' 非数字，回退为默认 999"
+        priority=999
+    fi
+    # 日志路径建议绝对路径（supervisord 的工作目录与当前 shell 不同）
+    if [[ "$stdout_log" != /* || "$stderr_log" != /* ]]; then
+        ui_warn "日志路径建议使用绝对路径，相对路径会相对 supervisord 的启动目录解析"
+        if ! ui_confirm "仍要继续?" "n"; then
+            ui_warn "已取消"; ui_pause; return 0
+        fi
+    fi
+
+    autostart=$(_to_bool "$autostart")
+    autorestart=$(_to_bool "$autorestart")
+
+    ui_title "预览配置"
+    echo "[program:$name]"
+    echo "command=$command"
+    echo "directory=$directory"
+    echo "user=$user"
+    echo "autostart=$autostart"
+    echo "autorestart=$autorestart"
+    echo "priority=$priority"
+    echo "stdout_logfile=$stdout_log"
+    echo "stderr_logfile=$stderr_log"
+    [[ -n "$env_str" ]] && echo "environment=$env_str"
+    echo
+
+    if ! ui_confirm "确认写入并加载?"; then
+        ui_warn "已取消"; ui_pause; return 0
+    fi
+
+    mkdir -p "$(dirname "$stdout_log")" "$(dirname "$stderr_log")" "$conf_dir" 2>/dev/null || true
+
+    if ! {
+        echo "[program:$name]"
+        echo "command=$command"
+        echo "directory=$directory"
+        echo "user=$user"
+        echo "autostart=$autostart"
+        echo "autorestart=$autorestart"
+        echo "priority=$priority"
+        echo "stdout_logfile=$stdout_log"
+        echo "stderr_logfile=$stderr_log"
+        echo "stdout_logfile_maxbytes=10MB"
+        echo "stdout_logfile_backups=10"
+        echo "stderr_logfile_maxbytes=10MB"
+        echo "stderr_logfile_backups=10"
+        # 注意：必须用 if 语句，不能写 `[[ -n "$x" ]] && echo ...`
+        # 否则 env 为空时该判断返回 1，整个 { } 重定向组被判为“写入失败”（文件其实已写成功）
+        if [[ -n "$env_str" ]]; then
+            echo "environment=$env_str"
+        fi
+    } > "$target" 2>/dev/null; then
+        ui_error "配置写入失败: $target"
+        ui_info "检查目录是否存在且有写权限: ls -ld $conf_dir"
+        ui_pause; return 1
+    fi
+
+    ui_info "已写入: $target"
+    # 落点自检：写对了目录但后缀不匹配 include 时，文件不会被加载
+    if ! _conf_source_files 2>/dev/null | grep -Fxq "$target"; then
+        ui_warn "该文件不在 supervisord 的 include 匹配范围内，可能不会被加载"
+        ui_info "当前 [include] files: $(_conf_include_patterns "$SM_MAIN_CONF" 2>/dev/null | tr '\n' ' ')"
+    fi
+
+    if supervisor_alive; then
+        ui_info "执行 reread + update ..."
+        local reread_out update_out
+        reread_out=$(supervisorctl reread 2>&1) || true
+        [[ -n "$reread_out" ]] && echo "$reread_out"
+        if [[ "$reread_out" == *"ERROR"* ]]; then
+            ui_error "reread 失败，配置可能有语法错误"
+            ui_info "查看完整错误: supervisorctl reread"
+            ui_info "配置文件: $target"
+            ui_pause; return 1
+        fi
+
+        update_out=$(supervisorctl update 2>&1) || true
+        [[ -n "$update_out" ]] && echo "$update_out"
+        if [[ "$update_out" == *"ERROR"* ]]; then
+            ui_error "update 失败"
+            ui_pause; return 1
+        fi
+
+        # update 对 autostart=true 的进程会自动拉起，再 start 会报 already started
+        if [[ "$autostart" == "true" ]]; then
+            ui_info "autostart=true，update 已自动启动该进程"
+        else
+            if ui_confirm "autostart=false，是否立即启动该进程?"; then
+                supervisorctl start "$name" || true
+            fi
+        fi
+        ui_success "添加完成。当前状态："
+        supervisorctl status "$name" 2>/dev/null || true
+    else
+        ui_warn "supervisord 未运行，启动后新进程会按 autostart 自动拉起"
+    fi
+    ui_pause
+}
+
+# ============================================================================
+#  模块: 启停重启
+# ============================================================================
+
+# 选择操作目标，结果写入全局 _SM_TARGET
+# 注意：不能用 $(...) 取值 —— ui_menu 会把选项列表打印到 stdout，
+# 被命令替换捕获后 target 会变成"整段菜单文本 + 进程名"，supervisorctl 必然报 no such process。
+_promote_target() {
+    local op="$1"
+    _SM_TARGET=""
+    local names=()
+    while IFS= read -r n; do names+=("$n"); done < <(_list_proc_names)
+    if [[ ${#names[@]} -eq 0 ]]; then
+        ui_error "当前没有受管进程"
+        ui_pause; return 1
+    fi
+    local options=()
+    for n in "${names[@]}"; do options+=("$n"); done
+    options+=("全部 (all)")
+    if ! ui_menu "选择要${op}的进程" "${options[@]}"; then return 1; fi
+    local choice="$_SM_MENU_CHOICE"
+    if [[ "$choice" -eq 0 ]]; then return 1; fi
+    if [[ "$choice" -eq $(( ${#names[@]} + 1 )) ]]; then
+        _SM_TARGET="all"
+    else
+        _SM_TARGET="${names[$((choice-1))]}"
+    fi
+    return 0
+}
+
+action_start()   { _action_ctl "启动" "start"; }
+action_stop()    { _action_ctl "停止"  "stop"; }
+action_restart() { _action_ctl "重启"  "restart"; }
+
+_action_ctl() {
+    local op="$1"; local cmd="$2"
+    ui_title "${op}进程"
+    if ! supervisor_alive; then
+        _report_not_alive; ui_pause; return 1
+    fi
+    _promote_target "$op" || { ui_pause; return 0; }
+    local target="$_SM_TARGET"
+    [[ -n "$target" ]] || { ui_warn "未选择目标"; ui_pause; return 0; }
+    ui_info "执行 supervisorctl $cmd $target ..."
+    if supervisorctl "$cmd" "$target"; then
+        ui_success "${op}完成"
+    else
+        ui_error "${op}失败"
+    fi
+    ui_pause
+}
+
+# ============================================================================
+#  模块: 日志
+# ============================================================================
+
+action_log() {
+    ui_title "查看日志"
+    if ! supervisor_alive; then
+        _report_not_alive; ui_pause; return 1
+    fi
+    local names=()
+    while IFS= read -r n; do names+=("$n"); done < <(_list_proc_names)
+    if [[ ${#names[@]} -eq 0 ]]; then
+        ui_error "没有受管进程"; ui_pause; return 1
+    fi
+    if ! ui_menu "选择进程" "${names[@]}"; then ui_pause; return 0; fi
+    local choice="$_SM_MENU_CHOICE"
+    [[ "$choice" -eq 0 ]] && { ui_pause; return 0; }
+    local name="${names[$((choice-1))]}"
+
+    local actions=(
+        "查看 stdout 末尾 (tail)"
+        "查看 stderr 末尾 (tail)"
+        "实时跟随 stdout (tail -f)"
+        "实时跟随 stderr (tail -f)"
+        "用 \$EDITOR 打开 stdout_logfile"
+        "用 \$EDITOR 打开 stderr_logfile"
+    )
+    if ! ui_menu "选择日志动作 [$name]" "${actions[@]}"; then ui_pause; return 0; fi
+    local act="$_SM_MENU_CHOICE"
+    [[ "$act" -eq 0 ]] && { ui_pause; return 0; }
+
+    case "$act" in
+        1) supervisorctl tail "$name" stdout ;;
+        2) supervisorctl tail "$name" stderr ;;
+        3) echo -e "${C_GRAY}Ctrl+C 退出${C_RESET}"; supervisorctl tail -f "$name" stdout ;;
+        4) echo -e "${C_GRAY}Ctrl+C 退出${C_RESET}"; supervisorctl tail -f "$name" stderr ;;
+        5|6)
+            local key
+            if [[ "$act" -eq 5 ]]; then key=stdout_logfile; else key=stderr_logfile; fi
+            local file
+            file=$(_lookup_key "$name" "$key")
+
+            if [[ -z "$file" ]]; then
+                ui_error "配置中未找到 $key（进程: $name）"
+                ui_info "该进程可能使用 supervisor 默认日志（AUTO 模式）"
+                local childdir
+                childdir=$(_lookup_key "$name" "childlogdir")
+                [[ -z "$childdir" ]] && childdir=$(awk -F'=' '$1=="childlogdir" {sub(/^[^=]*=/, ""); print; exit}' "$SM_MAIN_CONF" 2>/dev/null)
+                childdir="${childdir:-/var/log/supervisor}"
+                ui_info "可查看目录: $childdir/"
+                ui_info "或用菜单 [7] 的 tail 动作直接读运行中进程日志"
+            elif [[ "$file" == "AUTO" || "$file" == "auto" ]]; then
+                ui_warn "$key=AUTO，日志由 supervisor 自动管理"
+                local childdir
+                childdir=$(awk -F'=' '$1=="childlogdir" {sub(/^[^=]*=/, ""); print; exit}' "$SM_MAIN_CONF" 2>/dev/null)
+                childdir="${childdir:-/var/log/supervisor}"
+                ui_info "实际文件在 childlogdir 下: $childdir/"
+                ui_info "建议改用菜单 [7] 的 tail 动作，或把 $key 改为显式路径"
+            elif [[ ! -f "$file" ]]; then
+                ui_warn "$key 指向的文件尚不存在: $file"
+                ui_info "进程可能还没产生输出，或路径写错"
+                if ui_confirm "仍要打开编辑器查看/创建该文件?" "n"; then
+                    _open_editor "$file"
+                fi
+            else
+                _open_editor "$file"
+            fi
+            ;;
+    esac
+    ui_pause
+}
+
+# ============================================================================
+#  模块: 编辑/删除/重载/主配置
+# ============================================================================
+
+# 文件指纹：判断"编辑到底有没有改内容"，避免没改也提示重载
+_file_sig() {
+    if [[ -f "$1" ]]; then
+        cksum "$1" 2>/dev/null | awk '{print $1"-"$2}'
+    else
+        echo "missing"
+    fi
+}
+
+# 编辑前备份，成功则输出备份路径；失败返回 1（调用方只 warn，不阻塞编辑）
+_backup_file() {
+    local file="$1"
+    [[ -f "$file" ]] || return 1
+    local dir="$SM_BACKUP_DIR"
+    if ! mkdir -p "$dir" 2>/dev/null; then
+        # 兜底：无权限写 /var/backups 时退到临时目录
+        dir="${TMPDIR:-/tmp}/supervisor-manager-backup"
+        mkdir -p "$dir" 2>/dev/null || return 1
+    fi
+    local dest
+    dest="$dir/$(basename "$file").$(date +%Y%m%d-%H%M%S).$$"
+    cp -a "$file" "$dest" 2>/dev/null || return 1
+    printf '%s' "$dest"
+}
+
+# 执行 reread + update，返回 0=成功 1=失败
+# 关键：supervisorctl reread 遇到配置语法错误会打印 ERROR 并以非 0 退出，
+# 若忽略返回值，工具会继续打印"重载完成"，用户以为改动生效了——实际 supervisord
+# 仍在用内存里的旧配置。这是"编辑配置后没反应"最常见的原因。
+_do_reload() {
+    local out rc
+    out=$(supervisorctl reread 2>&1); rc=$?
+    [[ -n "$out" ]] && printf '%s\n' "$out"
+    if (( rc != 0 )) || [[ "$out" == *ERROR* ]]; then
+        ui_error "reread 失败：配置有语法错误，本次改动未生效"
+        ui_info "常见原因：段名应为 [program:name]、缺 command、引号/方括号不配对"
+        ui_info "supervisord 仍在运行改动前的配置，进程未受影响"
+        return 1
+    fi
+
+    out=$(supervisorctl update 2>&1); rc=$?
+    [[ -n "$out" ]] && printf '%s\n' "$out"
+    if (( rc != 0 )) || [[ "$out" == *ERROR* ]]; then
+        ui_error "update 失败：新配置未完全应用"
+        return 1
+    fi
+    return 0
+}
+
+# 列出 supervisord 实际会加载的进程配置文件（完整路径，已去重）
+# 依据 include，而不是硬编码 SM_CONF_DIR —— 详见"配置文件定位"一节
+_list_conf_files() {
+    local f
+    local -A seen=()
+    while IFS= read -r f; do
+        [[ -n "$f" && -f "$f" ]] || continue
+        [[ "$f" == "$SM_MAIN_CONF" ]] && continue
+        [[ -n "${seen[$f]:-}" ]] && continue
+        seen[$f]=1
+        printf '%s\n' "$f"
+    done < <(_conf_source_files)
+}
+
+# 列表为空时的诊断：把"为什么空"讲清楚，而不是只说目录为空
+_conf_diag_empty() {
+    ui_info "主配置:   ${SM_MAIN_CONF}（$( [[ -f "$SM_MAIN_CONF" ]] && echo 存在 || echo '不存在')）"
+    local pats
+    pats=$(_conf_include_patterns "$SM_MAIN_CONF" 2>/dev/null | tr '\n' ' ')
+    if [[ -n "${pats// /}" ]]; then
+        ui_info "[include] files: $pats"
+        ui_info "展开后没有匹配到文件，检查该路径/后缀是否写对（ls 一下）"
+    else
+        ui_warn "主配置里没有可解析的 [include] files"
+        ui_info "进程可能直接写在主配置中——这种情况请用菜单 [11] 编辑主配置"
+    fi
+    ui_info "也可用 SM_MAIN_CONF=... 或 SM_CONF_DIR=... 指定实际路径后重试"
+}
+
+action_edit() {
+    require_root || return 1
+    ui_title "编辑进程配置"
+
+    local f
+    local files=()
+    while IFS= read -r f; do files+=("$f"); done < <(_list_conf_files)
+    if [[ ${#files[@]} -eq 0 ]]; then
+        ui_error "没有找到任何进程配置文件（supervisord 加载范围内为空）"
+        _conf_diag_empty
+        # 常见情况：进程直接写在主配置里。与其让用户自己去找，不如直接给入口
+        if [[ -f "$SM_MAIN_CONF" ]] && grep -qE '^[[:space:]]*\[program:' "$SM_MAIN_CONF" 2>/dev/null; then
+            local pcnt
+            pcnt=$(grep -cE '^[[:space:]]*\[program:' "$SM_MAIN_CONF" 2>/dev/null)
+            ui_warn "主配置内联定义了 $pcnt 个 [program:x]，不在任何 conf.d 文件里"
+            if ui_confirm "现在编辑主配置?"; then
+                action_edit_main
+                return 0
+            fi
+        fi
+        ui_pause; return 1
+    fi
+    local options=()
+    for f in "${files[@]}"; do options+=("$(basename "$f")"); done
+    if ! ui_menu "选择配置文件" "${options[@]}"; then ui_pause; return 0; fi
+    local choice="$_SM_MENU_CHOICE"
+    [[ "$choice" -eq 0 ]] && { ui_pause; return 0; }
+    local file="${files[$((choice-1))]}"
+
+    # 编辑前备份：改坏配置属不可逆事故，先留一份
+    local bak=""
+    if bak=$(_backup_file "$file"); then
+        ui_info "已备份: $bak"
+    else
+        ui_warn "备份失败（不影响编辑，但改坏后无法自动回滚）"
+    fi
+
+    local sig_before sig_after rc=0
+    sig_before=$(_file_sig "$file")
+    ui_info "编辑: $file"
+    _open_editor "$file" || rc=$?
+
+    if (( rc == 127 )); then
+        ui_pause; return 1                 # 找不到编辑器，_open_editor 已报错
+    elif (( rc != 0 )); then
+        ui_error "编辑器异常退出（退出码 $rc），文件可能没有保存"
+        [[ -n "$bak" ]] && ui_info "如需回滚: cp -a '$bak' '$file'"
+        ui_pause; return 1
+    fi
+
+    sig_after=$(_file_sig "$file")
+    if [[ "$sig_before" == "$sig_after" ]]; then
+        ui_info "文件内容未变化，无需重载"
+        ui_pause; return 0
+    fi
+
+    ui_success "配置文件已修改: $file"
+    [[ -n "$bak" ]] && ui_info "回滚命令: cp -a '$bak' '$file'"
+
+    # 闭环：改完直接问要不要生效，失败可回到编辑器继续改
+    while true; do
+        if ! ui_confirm "是否立即重载让改动生效?"; then
+            ui_warn "已跳过重载。supervisord 仍使用旧配置，稍后可执行菜单 [9]"
+            ui_pause; return 0
+        fi
+        if ! supervisor_alive; then
+            _report_not_alive; ui_pause; return 1
+        fi
+        if _do_reload; then
+            ui_success "改动已生效。当前状态："
+            _render_status_table
+            ui_pause; return 0
+        fi
+        if ! ui_confirm "重载失败，是否重新打开 $file 修改?"; then
+            [[ -n "$bak" ]] && ui_info "回滚命令: cp -a '$bak' '$file'"
+            ui_pause; return 1
+        fi
+        local erc=0
+        _open_editor "$file" || erc=$?
+        if (( erc != 0 )); then
+            ui_error "编辑器异常（退出码 $erc），已退出"
+            [[ -n "$bak" ]] && ui_info "回滚命令: cp -a '$bak' '$file'"
+            ui_pause; return 1
+        fi
+        ui_info "再次尝试重载 ..."
+    done
+}
+
+# 从一个配置文件里提取受管实体名（[program:x] / [group:x]）
+# 一个 .conf 里可能定义多个 program，直接拿文件名去 stop 会 no such process
+_conf_entity_names() {
+    local file="$1"
+    awk '
+        /^[[:space:]]*\[(program|group):/ {
+            line = $0
+            sub(/^[[:space:]]*\[/, "", line)
+            sub(/\].*$/, "", line)
+            sub(/^(program|group):[[:space:]]*/, "", line)
+            if (length(line) > 0) print line
+        }
+    ' "$file" 2>/dev/null
+}
+
+action_delete() {
+    require_root || return 1
+    ui_title "删除守护进程"
+    ui_warn "此操作不可逆，会从磁盘删除配置文件并停止对应进程"
+
+    local f
+    local files=()
+    while IFS= read -r f; do files+=("$f"); done < <(_list_conf_files)
+    if [[ ${#files[@]} -eq 0 ]]; then
+        ui_error "没有找到任何进程配置文件（supervisord 加载范围内为空）"
+        _conf_diag_empty
+        if [[ -f "$SM_MAIN_CONF" ]] && grep -qE '^[[:space:]]*\[program:' "$SM_MAIN_CONF" 2>/dev/null; then
+            ui_warn "有进程是内联写在主配置里的，删文件删不掉它们"
+            ui_info "请用菜单 [11] 编辑主配置，手动移除对应 [program:x] 段后重启"
+        fi
+        ui_pause; return 1
+    fi
+    local options=()
+    for f in "${files[@]}"; do options+=("$(basename "$f")"); done
+    if ! ui_menu "选择要删除的配置" "${options[@]}"; then ui_pause; return 0; fi
+    local choice="$_SM_MENU_CHOICE"
+    [[ "$choice" -eq 0 ]] && { ui_pause; return 0; }
+    local file="${files[$((choice-1))]}"
+
+    # 文件名 ≠ 程序名：按实际 [program:x] 段名来停进程
+    local ents=()
+    while IFS= read -r e; do ents+=("$e"); done < <(_conf_entity_names "$file")
+    if [[ ${#ents[@]} -eq 0 ]]; then
+        ui_warn "该文件里没解析到 [program:x] 段（可能格式有误），仅删除文件"
+    fi
+
+    echo
+    echo -e "${C_RED}${C_BOLD}即将执行：${C_RESET}"
+    if [[ ${#ents[@]} -gt 0 ]]; then
+        echo "  1. supervisorctl stop ${ents[*]}  （停止进程）"
+    else
+        echo "  1. 跳过停止（未解析到程序名）"
+    fi
+    echo "  2. rm -f $file  （删除配置文件）"
+    echo "  3. supervisorctl reread && supervisorctl update"
+    echo
+    if ! ui_confirm "确认删除 [$(basename "$file")]？此操作不可逆！" "n"; then
+        ui_warn "已取消"; ui_pause; return 0
+    fi
+
+    if supervisor_alive && [[ ${#ents[@]} -gt 0 ]]; then
+        ui_info "停止进程: ${ents[*]}"
+        supervisorctl stop "${ents[@]}" 2>&1 || ui_warn "停止失败（进程可能已停止或状态转换中）"
+    fi
+
+    # 删除前留一份，误删可恢复
+    local bak=""
+    if bak=$(_backup_file "$file"); then
+        ui_info "已备份: $bak"
+    fi
+
+    if ! rm -f "$file" 2>/dev/null; then
+        ui_error "删除配置文件失败: $file"
+        ui_info "检查文件权限与所在目录权限: ls -l $file"
+        ui_pause; return 1
+    fi
+    if [[ -f "$file" ]]; then
+        ui_error "配置文件仍存在，删除未生效: $file"
+        ui_pause; return 1
+    fi
+    ui_info "已删除配置文件: $file"
+
+    if supervisor_alive; then
+        if ! _do_reload; then
+            ui_warn "配置重载失败，supervisord 可能仍认为该进程存在；稍后执行菜单 [9] 重试"
+            [[ -n "$bak" ]] && ui_info "恢复文件: cp -a '$bak' '$file'"
+        fi
+    fi
+    ui_success "已删除: $(basename "$file")"
+    ui_pause
+}
+
+action_reload() {
+    require_root || return 1
+    ui_title "重载 supervisor 配置"
+    if ! supervisor_alive; then
+        _report_not_alive; ui_pause; return 1
+    fi
+    ui_info "执行 reread + update ..."
+    if _do_reload; then
+        ui_success "重载完成。当前状态："
+        _render_status_table
+    else
+        ui_warn "未生效：supervisord 仍在用改动前的配置"
+        ui_info "可执行菜单 [8] 编辑对应配置，或 cp -a 备份文件回滚"
+    fi
+    ui_pause
+}
+
+action_edit_main() {
+    require_root || return 1
+    ui_title "编辑主 supervisord.conf"
+    [[ -f "$SM_MAIN_CONF" ]] || { ui_error "未找到 $SM_MAIN_CONF"; ui_pause; return 1; }
+
+    local bak=""
+    if bak=$(_backup_file "$SM_MAIN_CONF"); then
+        ui_info "已备份: $bak"
+    else
+        ui_warn "备份失败（不影响编辑，但改坏后无法自动回滚）"
+    fi
+
+    local sig_before sig_after rc=0
+    sig_before=$(_file_sig "$SM_MAIN_CONF")
+    ui_info "编辑: $SM_MAIN_CONF"
+    _open_editor "$SM_MAIN_CONF" || rc=$?
+    if (( rc == 127 )); then
+        ui_pause; return 1
+    elif (( rc != 0 )); then
+        ui_error "编辑器异常退出（退出码 $rc），文件可能没有保存"
+        [[ -n "$bak" ]] && ui_info "如需回滚: cp -a '$bak' '$SM_MAIN_CONF'"
+        ui_pause; return 1
+    fi
+
+    sig_after=$(_file_sig "$SM_MAIN_CONF")
+    if [[ "$sig_before" == "$sig_after" ]]; then
+        ui_info "文件内容未变化"
+        ui_pause; return 0
+    fi
+
+    ui_success "主配置已修改: $SM_MAIN_CONF"
+    [[ -n "$bak" ]] && ui_info "回滚命令: cp -a '$bak' '$SM_MAIN_CONF'"
+
+    # 主配置改的是端口/socket/日志级别等，reread 不生效，必须重启 supervisord
+    local svc="supervisor"
+    if systemctl cat supervisord >/dev/null 2>&1 && ! systemctl cat supervisor >/dev/null 2>&1; then
+        svc="supervisord"
+    fi
+    ui_warn "主配置的改动需要重启 supervisord 才会生效（reread 不够）"
+    ui_info "重启命令: systemctl restart $svc"
+    if ui_confirm "现在重启 $svc?" "n"; then
+        if systemctl restart "$svc"; then
+            ui_success "已重启 $svc"
+        else
+            ui_error "重启失败，请手动执行: systemctl restart $svc && systemctl status $svc -l"
+        fi
+    else
+        ui_info "未重启。改动尚未生效"
+    fi
+    ui_pause
+}
+
+# ============================================================================
+#  主菜单
+# ============================================================================
+
+main_menu() {
+    while true; do
+        # 首页 = 状态看板 + 菜单（一屏看完，不用再单独进"查看状态"）
+        # _SM_SKIP_CLEAR=1 用于跳过本次清屏（看日志回来时保留刚读到的内容）
+        if [[ "${_SM_SKIP_CLEAR:-0}" == "1" ]]; then
+            _SM_SKIP_CLEAR=0
+            echo
+        else
+            _clear_screen
+        fi
+        # locale 自适应的一次性提示：放在清屏之后，否则首屏会被刷掉
+        if [[ -n "$_SM_LOCALE_NOTE" ]]; then
+            echo -e "$_SM_LOCALE_NOTE"
+            _SM_LOCALE_NOTE=""
+        fi
+        ui_title "Supervisor Manager v$SM_VERSION"
+        _render_status_table
+
+        if ! ui_menu --bare --zero "退出" "" \
+            "安装 Supervisor" \
+            "配置开机自启" \
+            "添加守护进程" \
+            "启动进程" \
+            "停止进程" \
+            "重启进程" \
+            "查看/跟随日志" \
+            "编辑进程配置" \
+            "重载 supervisor 配置 (reread+update)" \
+            "删除守护进程" \
+            "编辑主 supervisord.conf"; then
+            # EOF（Ctrl-D / 管道结束）
+            echo "再见"; exit 0
+        fi
+        local choice="$_SM_MENU_CHOICE"
+        case "$choice" in
+            1)  action_install ;;
+            2)  action_boot ;;
+            3)  action_add ;;
+            4)  action_start ;;
+            5)  action_stop ;;
+            6)  action_restart ;;
+            7)  action_log; _SM_SKIP_CLEAR=1 ;;
+            8)  action_edit ;;
+            9)  action_reload ;;
+            10) action_delete ;;
+            11) action_edit_main ;;
+            0)  echo "再见"; exit 0 ;;
+        esac
+    done
+}
+
+# ============================================================================
+#  Self-install: 把脚本自身安装到 /usr/local/bin/svm（或自定义名字）
+# ============================================================================
+
+# 检测 PATH 中的某个命令是否是本工具自身
+# 注意：特征串不带版本号——否则新版脚本检测旧版安装会误判为"非本工具"
+_is_self_cmd() {
+    local cmd_path="$1"
+    [[ -f "$cmd_path" ]] || return 1
+    grep -q "Supervisor Manager v" "$cmd_path" 2>/dev/null
+}
+
+# 提取已安装版本的版本号（读 SM_VERSION="x.y.z" 行）
+_get_self_version() {
+    local cmd_path="$1"
+    [[ -f "$cmd_path" ]] || return 1
+    sed -n 's/^SM_VERSION="\([0-9][0-9.]*\)"$/\1/p' "$cmd_path" 2>/dev/null | head -1
+}
+
+# 寻找一个可用的命令名（svm 优先，冲突则尝试 svmgr/supmgr）
+_pick_install_name() {
+    local prefer="$1"
+    local candidates=("$prefer")
+    [[ "$prefer" != "svm" ]] && candidates+=("svm")
+    candidates+=("svmgr" "supmgr" "supvmgr")
+
+    local existing
+    for name in "${candidates[@]}"; do
+        existing=$(command -v "$name" 2>/dev/null || true)
+        if [[ -z "$existing" ]]; then
+            echo "$name"; return 0
+        fi
+        # 已存在，但是否是本工具自身？
+        if _is_self_cmd "$existing"; then
+            echo "$name"; return 0
+        fi
+    done
+    # 全都冲突
+    echo ""
+    return 1
+}
+
+self_install() {
+    local install_name="svm"
+    local install_path="/usr/local/bin"
+    local force=0
+
+    # 解析剩余参数
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            --as)
+                if [[ $# -lt 2 || -z "${2:-}" ]]; then
+                    ui_error "--as 需要一个命令名参数"
+                    return 1
+                fi
+                install_name="$2"; shift 2 ;;
+            --path)
+                if [[ $# -lt 2 || -z "${2:-}" ]]; then
+                    ui_error "--path 需要一个目录参数"
+                    return 1
+                fi
+                install_path="$2"; shift 2 ;;
+            --force|-f)
+                force=1; shift ;;
+            --help|-h)
+                cat <<EOF
+用法: sm.sh --install [--as NAME] [--path PATH] [--force]
+
+  --as NAME      指定安装后的命令名（默认 svm，冲突则自动尝试 svmgr/supmgr）
+  --path PATH    安装目录（默认 /usr/local/bin）
+  --force        跳过冲突检测，强制覆盖
+
+示例:
+  sm.sh --install                    # 安装为 svm（冲突则降级）
+  sm.sh --install --as svmgr         # 强制安装为 svmgr
+  sm.sh --install --path /opt/bin    # 装到 /opt/bin/svm
+EOF
+                return 0
+                ;;
+            *) ui_error "未知参数: $1"; return 1 ;;
+        esac
+    done
+
+    require_root || return 1
+
+    ui_title "Self-install"
+
+    # 安装目录检查
+    if [[ ! -d "$install_path" ]]; then
+        ui_error "安装目录不存在: $install_path"
+        ui_info "请先 mkdir -p $install_path 或换一个目录"
+        return 1
+    fi
+
+    # 冲突检测（含升级场景识别）
+    local final_name="$install_name"
+    local is_upgrade=0
+    if [[ $force -eq 0 ]]; then
+        local existing
+        existing=$(command -v "$install_name" 2>/dev/null || true)
+        if [[ -n "$existing" ]]; then
+            if _is_self_cmd "$existing"; then
+                local old_ver
+                old_ver=$(_get_self_version "$existing" || echo "unknown")
+                if [[ "$old_ver" == "$SM_VERSION" ]]; then
+                    ui_info "检测到同版本 v$SM_VERSION 已安装: $existing（将原样覆盖）"
+                else
+                    is_upgrade=1
+                    ui_info "检测到旧版本 v$old_ver → 升级到 v$SM_VERSION"
+                    ui_info "已有安装: $existing"
+                fi
+            else
+                ui_warn "命令 '$install_name' 已被占用: $existing"
+                ui_info "尝试自动选择一个空闲名字..."
+                final_name=$(_pick_install_name "$install_name") || {
+                    ui_error "svm / svmgr / supmgr / supvmgr 都被占用"
+                    ui_info "请用 --as <自定义名> 指定一个，或 --force 强制覆盖"
+                    return 1
+                }
+                if [[ "$final_name" != "$install_name" ]]; then
+                    ui_info "降级使用: $final_name"
+                fi
+            fi
+        fi
+    fi
+
+    local target="$install_path/$final_name"
+    local src
+    # BASH_SOURCE[0] 在函数内 = 脚本自身路径；$0 在 source 模式下不可靠
+    src="${BASH_SOURCE[0]:-$0}"
+    src=$(readlink -f "$src" 2>/dev/null || echo "$src")
+
+    if [[ ! -f "$src" ]]; then
+        ui_error "无法定位脚本源文件: $src"
+        return 1
+    fi
+
+    ui_info "源文件:   $src"
+    ui_info "目标:     $target"
+    echo
+    ui_info "覆盖安装只更新本命令自身，不会触碰以下内容："
+    echo "  - $SM_MAIN_CONF 与 $SM_CONF_DIR/ 下的进程配置"
+    echo "  - systemd unit（开机自启配置）"
+    echo "  - 正在运行的 supervisord 与受管进程（无需重启）"
+
+    local confirm_word="安装"
+    [[ $is_upgrade -eq 1 ]] && confirm_word="升级"
+    if ! ui_confirm "确认${confirm_word}?"; then
+        ui_warn "已取消"; return 0
+    fi
+
+    # 备份旧版本（如果是已有文件且非本工具）
+    if [[ -f "$target" ]] && ! _is_self_cmd "$target"; then
+        local backup="${target}.bak.$(date +%s)"
+        ui_warn "目标已有非本工具文件，备份为: $backup"
+        cp -a "$target" "$backup"
+    fi
+    # 升级场景：旧版本是本工具，备份一份带版本号便于回滚
+    if [[ $is_upgrade -eq 1 && -f "$target" ]]; then
+        local old_ver_bak
+        old_ver_bak=$(_get_self_version "$target" || echo "old")
+        local backup="${target}.v${old_ver_bak}"
+        cp -a "$target" "$backup" 2>/dev/null && \
+            ui_info "旧版本已备份: $backup（回滚: mv $backup $target）"
+    fi
+
+    install -m 0755 "$src" "$target" || {
+        ui_error "install 命令失败"
+        return 1
+    }
+
+    ui_success "安装完成: $target"
+
+    # PATH 检查
+    case ":$PATH:" in
+        *":$install_path:"*) ;;
+        *) ui_warn "注意: $install_path 不在 PATH 中，请手动加入" ;;
+    esac
+
+    # 验证
+    if command -v "$final_name" >/dev/null 2>&1; then
+        ui_info "验证: $(command -v "$final_name")"
+        ui_info "现在可以直接输入 '$final_name' 启动"
+    else
+        ui_warn "命令未在 PATH 中找到，需重新登录或 source ~/.bashrc"
+    fi
+
+    # 升级/安装后的完整性检查：supervisord 与其开机自启状态
+    echo
+    ui_info "── 环境检查 ──"
+    if has_supervisord; then
+        ui_info "supervisord 已安装: $(supervisord --version 2>/dev/null | head -1)"
+        if supervisor_alive; then
+            ui_info "supervisord 运行中"
+        else
+            ui_warn "supervisord 未运行，运行 '$final_name' 进菜单 [2] 启动"
+        fi
+        # systemd 开机自启检查（不适用于非 systemd 环境）
+        if [[ -d /run/systemd/system ]]; then
+            local svc
+            for svc in supervisor supervisord; do
+                if systemctl cat "$svc" >/dev/null 2>&1; then
+                    if systemctl is-enabled "$svc" >/dev/null 2>&1; then
+                        ui_info "开机自启 ($svc): 已启用"
+                    else
+                        ui_warn "开机自启 ($svc): 未启用，运行 '$final_name' 进菜单 [2] 配置"
+                    fi
+                    break
+                fi
+            done
+        fi
+    else
+        ui_warn "supervisord 未安装，运行 '$final_name' 进菜单 [1] 安装"
+    fi
+
+    # 提示典型用法
+    cat <<EOF
+
+${C_GRAY}── 常用入口 ──${C_RESET}
+  $final_name              # 进入交互菜单
+  $final_name --install    # 安装/升级本命令（带 --as/--path）
+  $final_name -c status    # 一次性命令：直接显示状态
+
+EOF
+}
+
+# ============================================================================
+#  用法 / 帮助
+# ============================================================================
+
+usage() {
+    cat <<EOF
+${C_BOLD}Supervisor Manager v$SM_VERSION${C_RESET}
+
+用法:
+  sm.sh                       进入交互式菜单
+  sm.sh --install [选项]      安装/升级为系统命令（默认 svm，冲突则降级 svmgr）
+  sm.sh -c <cmd>              一次性命令
+  sm.sh --help                显示本帮助
+
+--install 选项:
+  --as NAME                   指定命令名（默认 svm）
+  --path PATH                 安装目录（默认 /usr/local/bin）
+  --force                     跳过冲突检测
+
+升级说明:
+  用新版脚本重新执行 --install 即可升级；旧版本自动备份为 svm.v<旧版本号>
+  覆盖安装只更新本命令，不影响 /etc/supervisor 配置、systemd unit 与运行中的进程
+
+-c 支持的命令:
+  status                      supervisorctl status
+  install                     调用菜单 [1]
+  boot                        调用菜单 [2]
+
+环境变量:
+  SM_CONF_DIR                 子进程配置目录（默认 /etc/supervisor/conf.d）
+  SM_MAIN_CONF                主配置文件
+  SM_LOG_DIR                  日志目录
+  SM_BACKUP_DIR               编辑/删除前的自动备份目录
+  SM_NO_CLEAR=1               禁用首页清屏（保留终端滚动历史）
+  SM_LOCALE=0                 关闭 locale 自适应；SM_LOCALE=<name> 指定 UTF-8 locale
+  SM_WIDTH=68                 界面总宽（列数）
+EOF
+}
+
+# ============================================================================
+#  入口
+# ============================================================================
+
+# 显示宽度计算的字节表 + 自检（纯内建命令，开销可忽略；对所有模式生效）
+_sm_bytes_init
+_sm_width_selftest || true
+_fit_width
+
+# locale 自适应：在任何输出之前把本进程切到 UTF-8
+# source 模式（SM_NO_ENTRY=1）跳过——改调用方的全局环境不是被加载者该做的事
+if [[ "${SM_NO_ENTRY:-0}" != "1" ]]; then
+    _ensure_utf8_locale
+fi
+
+# 解析参数（source 模式下 $# 是调用方的参数，不能当成自己的命令行来解析）
+if [[ $# -ge 1 && "${SM_NO_ENTRY:-0}" != "1" ]]; then
+    case "$1" in
+        --help|-h)
+            usage; exit 0 ;;
+        --install|install)
+            shift
+            self_install "$@"
+            exit $?
+            ;;
+        -c)
+            if [[ $# -lt 2 ]]; then
+                ui_error "用法: sm.sh -c <command>"
+                exit 1
+            fi
+            case "$2" in
+                status)
+                    if supervisor_alive; then
+                        supervisorctl status
+                    else
+                        _report_not_alive
+                        exit 1
+                    fi
+                    ;;
+                install) action_install ;;
+                boot)    action_boot ;;
+                *) ui_error "未知命令: $2"; exit 1 ;;
+            esac
+            exit 0
+            ;;
+        --version|-V)
+            echo "Supervisor Manager v$SM_VERSION"
+            exit 0
+            ;;
+        *)
+            ui_error "未知参数: $1"
+            ui_info "执行 sm.sh --help 查看用法"
+            exit 1
+            ;;
+    esac
+fi
+
+# 无参数：进入交互式菜单（SM_NO_ENTRY=1 时跳过，便于 source 加载）
+if [[ "${SM_NO_ENTRY:-0}" != "1" ]]; then
+    main_menu
+fi
