@@ -39,7 +39,7 @@
 # 改为各 action 内部显式 return/error 处理。
 set -uo pipefail
 
-SM_VERSION="1.6.2"
+SM_VERSION="1.6.3"
 
 # 配置默认值（可被环境变量覆盖）
 SM_CONF_DIR="${SM_CONF_DIR:-/etc/supervisor/conf.d}"
@@ -101,9 +101,9 @@ _detect_serial() {
 if _detect_serial; then _SM_SERIAL=1; fi
 # Milliseconds between complete UI lines/prompts, only in serial mode.
 # Bound the value to avoid accidental multi-minute stalls.
-_SM_SERIAL_DELAY_MS="${SM_SERIAL_DELAY_MS:-50}"
+_SM_SERIAL_DELAY_MS="${SM_SERIAL_DELAY_MS:-150}"
 if [[ ! "$_SM_SERIAL_DELAY_MS" =~ ^[0-9]{1,4}$ ]] || (( 10#$_SM_SERIAL_DELAY_MS > 1000 )); then
-    _SM_SERIAL_DELAY_MS=50
+    _SM_SERIAL_DELAY_MS=150
 fi
 _SM_SERIAL_DELAY_MS=$((10#$_SM_SERIAL_DELAY_MS))
 printf -v _SM_SERIAL_DELAY '%d.%03d' "$((_SM_SERIAL_DELAY_MS / 1000))" "$((_SM_SERIAL_DELAY_MS % 1000))"
@@ -2288,7 +2288,7 @@ self_uninstall() (
 )
 usage() {
     if (( _SM_ENGLISH )); then
-        _ui_printf 'Supervisor Manager v%s\n  svm                  Interactive menu\n  svm --install        Install/upgrade\n  svm --uninstall      Remove manager only\n  svm -c status        Show status\n  svm --version         Version\n  SM_SERIAL=0 svm      Force normal interface\n  SM_SERIAL_DELAY_MS=50 svm  Serial UI delay (milliseconds; 0 disables)\n  SM_LANG=zh svm       Chinese interface\n  SM_PROFILE=package|mw|auto svm  Select profile (choose one)\n  SM_SUPERVISORD=/path SM_SUPERVISORCTL=/path SM_MAIN_CONF=/path svm\n' "$SM_VERSION"
+        _ui_printf 'Supervisor Manager v%s\n  svm                  Interactive menu\n  svm --install        Install/upgrade\n  svm --uninstall      Remove manager only\n  svm -c status        Show status\n  svm --version         Version\n  SM_SERIAL=0 svm      Force normal interface\n  SM_SERIAL_DELAY_MS=150 svm  Serial UI delay (milliseconds; 0 disables)\n  SM_LANG=zh svm       Chinese interface\n  SM_PROFILE=package|mw|auto svm  Select profile (choose one)\n  SM_SUPERVISORD=/path SM_SUPERVISORCTL=/path SM_MAIN_CONF=/path svm\n' "$SM_VERSION"
         return 0
     fi
     _ui_here <<EOF
@@ -2322,7 +2322,7 @@ ${C_BOLD}Supervisor Manager v$SM_VERSION${C_RESET}
   SM_BACKUP_DIR               编辑/删除前的自动备份目录
   SM_NO_CLEAR=1               禁用首页清屏（保留终端滚动历史）
   SM_SERIAL=1/0               强制开启/关闭串口简化显示（默认自动识别）
-  SM_SERIAL_DELAY_MS=50        串口界面每行/提示间隔毫秒（0-1000，0 关闭）
+  SM_SERIAL_DELAY_MS=150        串口界面每行/提示间隔毫秒（0-1000，0 关闭）
   SM_LANG=zh/en               界面语言（默认中文，英文可选）
   SM_COLOR=0                  禁用颜色
   SM_LOCALE=0                 关闭 locale 自适应；SM_LOCALE=<name> 指定 UTF-8 locale

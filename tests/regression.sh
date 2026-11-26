@@ -157,13 +157,13 @@ echo 'Multi-instance, serial and uninstall regression tests passed'
 # must remain untouched.
 (
     _SM_SERIAL=1
-    _SM_SERIAL_DELAY_MS=50
-    _SM_SERIAL_DELAY=0.050
+    _SM_SERIAL_DELAY_MS=150
+    _SM_SERIAL_DELAY=0.150
     sleep() { printf '%s\n' "$1" >> "$tmp/ui-sleeps"; }
     : > "$tmp/ui-sleeps"
     _ui_printf '%s\n%s\n' '确认安装/升级' '主配置文件' > "$tmp/ui-paced"
     [[ "$(cat "$tmp/ui-paced")" == $'确认安装/升级\n主配置文件' ]]
-    [[ "$(cat "$tmp/ui-sleeps")" == $'0.050\n0.050' ]]
+    [[ "$(cat "$tmp/ui-sleeps")" == $'0.150\n0.150' ]]
     _ui_write '确认安装/升级? [y/N]: ' > "$tmp/ui-prompt"
     [[ "$(cat "$tmp/ui-prompt")" == '确认安装/升级? [y/N]: ' ]]
     [[ "$(wc -l < "$tmp/ui-sleeps")" -eq 3 ]]
@@ -176,3 +176,9 @@ echo 'Multi-instance, serial and uninstall regression tests passed'
     [[ "$(wc -l < "$tmp/ui-sleeps")" -eq 3 ]]
 )
 echo 'Serial UI pacing regression tests passed'
+
+# Default and invalid input fall back to 150ms; explicit valid override works.
+env -u SM_SERIAL_DELAY_MS SM_NO_ENTRY=1 SM_SERIAL=1 bash -c 'source ./sm.sh; [[ "$_SM_SERIAL_DELAY_MS" == 150 && "$_SM_SERIAL_DELAY" == 0.150 ]]'
+SM_SERIAL_DELAY_MS=invalid SM_NO_ENTRY=1 SM_SERIAL=1 bash -c 'source ./sm.sh; [[ "$_SM_SERIAL_DELAY_MS" == 150 && "$_SM_SERIAL_DELAY" == 0.150 ]]'
+SM_SERIAL_DELAY_MS=300 SM_NO_ENTRY=1 SM_SERIAL=1 bash -c 'source ./sm.sh; [[ "$_SM_SERIAL_DELAY_MS" == 300 && "$_SM_SERIAL_DELAY" == 0.300 ]]'
+echo 'Serial default delay regression tests passed'
