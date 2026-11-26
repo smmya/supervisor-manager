@@ -4,11 +4,17 @@
 
 设计目标与 [Supervisord TUI (god)](https://github.com/nicklasos/god) 不同：**不走 TUI 方向**，没有 vim 风格的全屏界面，就是普通的"打印标题 → 列菜单 → read 数字 → 进流程"，跟 `nvm` / `rvm` 那种用户体验类似。
 
+## v1.6.1：默认中文及实例信息本地化
+
+- SSH 与 QM 串口均默认中文，串口仍禁用颜色、清屏、复杂 Unicode 表格排版及 locale 自动调整。界面语言和终端模式独立：`SM_LANG=en svm` 可按需选择英文兜底，`SM_LANG=zh svm` 恢复中文。
+- 首页实例名称、自动/手动选择方式、主程序、控制程序、主配置文件及服务状态均使用中文标签；程序名、配置路径、进程原始状态和日志内容不翻译、不删减。
+- 保留 v1.6.0 多实例选择、卸载与 64 MiB 日志预算。以下串口说明以本节为准。
+
 ## v1.6.0：串口兼容、多实例选择与菜单卸载
 
 - 主菜单新增 13「卸载 SVM 管理工具」；与 `svm --uninstall` 共用确认逻辑。取消后返回菜单，成功后退出当前界面。仅移除正在运行的 SVM 脚本，保留 Supervisor、所有业务配置、日志、备份及已保存实例设置。
 
-- PVE qm terminal 进入 /dev/ttyS* 等串口设备时自动使用简化 ASCII 界面：禁用 ANSI 颜色、清屏和 Unicode 宽度计算，不自动切换 locale。SSH 保持正常中文界面。SM_SERIAL=1/0 可强制开启/关闭；SM_COLOR=0 单独禁用颜色。
+- PVE qm terminal 进入 /dev/ttyS* 等串口设备时自动使用简化中文界面：禁用 ANSI 颜色、清屏和 Unicode 宽度计算，不自动切换 locale。SSH 保持正常中文界面。SM_SERIAL=1/0 可强制开启/关闭；SM_COLOR=0 单独禁用颜色。
 - 菜单 12 可选择包管理器版本、MW 面板版本、手动指定版本、恢复自动选择。默认自动选择顺序为包管理器 > MW；手动输入是显式选择，不会猜测未知路径。切换仅改变管理目标，不启动或停止 daemon。
 - MW 默认配置 /www/server/supervisor/supervisor.conf；优先使用 /www/server/mdserver-web/bin 下的 supervisord、supervisorctl，兼容常见 venv 目录与共享程序路径。MW 日志默认 /www/server/supervisor/log。
 - 手动模式分别设置 supervisord、supervisorctl、主配置和可选 systemd unit。可保存至 /etc/supervisor-manager/instance.conf（root 0600，不作为 shell source）。SM_PROFILE、SM_SUPERVISORD、SM_SUPERVISORCTL、SM_MAIN_CONF、SM_SERVICE 可覆盖选择。

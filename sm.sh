@@ -39,7 +39,7 @@
 # 改为各 action 内部显式 return/error 处理。
 set -uo pipefail
 
-SM_VERSION="1.6.0"
+SM_VERSION="1.6.1"
 
 # 配置默认值（可被环境变量覆盖）
 SM_CONF_DIR="${SM_CONF_DIR:-/etc/supervisor/conf.d}"
@@ -82,8 +82,11 @@ _SM_DW_OK=0
 _SM_TESTING=0
 _SM_PAD=""        # _pad_c / _rule 的输出落点（避免用 $( ) 取结果而 fork）
 
-# Physical serial consoles use plain ASCII; SSH stays in the normal UI.
+# Terminal compatibility and UI language are independent.
+# Both SSH and physical serial consoles default to Chinese.
 _SM_SERIAL=0
+_SM_ENGLISH=0
+case "${SM_LANG:-zh}" in en|en_US|en_US.UTF-8|ascii) _SM_ENGLISH=1;; esac
 _detect_serial() {
     case "${SM_SERIAL:-auto}" in
         1) return 0;;
@@ -364,7 +367,7 @@ ui_line() {
 }
 
 _ui_text() {
-    if (( _SM_SERIAL )); then printf '%s' "$2"; else printf '%s' "$1"; fi
+    if (( _SM_ENGLISH )); then printf '%s' "$2"; else printf '%s' "$1"; fi
 }
 
 ui_title() {
@@ -375,14 +378,8 @@ ui_title() {
 
 # 四种前缀统一成 7 个字符，后面的正文才能左对齐
 _ui_message() {
-    local message="$*"
-    if (( _SM_SERIAL )); then
-        # All primary labels are bilingual. Keep details ASCII in secondary messages.
-        message=$(printf '%s' "$message" | LC_ALL=C tr -cd '\11\12\15\40-\176')
-        local detail="${message#*]}"
-        if [[ "$detail" != *[[:alnum:]]* ]]; then message="${message%%]*}] See SSH session for detailed message."; fi
-    fi
-    printf '%s\n' "$message"
+    # Language is chosen at the call site. Preserve paths and error details.
+    printf '%s\n' "$*"
 }
 ui_info()    { _ui_message "${C_GREEN}[INFO]${C_RESET}  $*"; }
 ui_warn()    { _ui_message "${C_YELLOW}[WARN]${C_RESET}  $*"; }
@@ -397,7 +394,7 @@ ui_ask() {
     else
         printf -v p "${C_BOLD}%s${C_RESET}: " "$prompt"
     fi
-    if (( _SM_SERIAL )); then p=$(printf '%s' "$p" | LC_ALL=C tr -cd '\40-\176'); fi
+
     read -r -p "$p" input || return 1
     if [[ -z "$input" && -n "$default" ]]; then echo "$default"
     else printf '%s\n' "$input"; fi
@@ -405,8 +402,8 @@ ui_ask() {
 
 # ui_confirm "提示" [y|n] -> 0=是 1=否
 ui_confirm() {
-    local prompt="${1:-Confirm?}"; local default="${2:-y}"; local input
-    if (( _SM_SERIAL )); then prompt=$(printf '%s' "$prompt" | LC_ALL=C tr -cd '\40-\176'); [[ -n "$prompt" && "$prompt" == *[[:alnum:]]* ]] || prompt="Confirm action?"; fi
+    local prompt="${1:-$(_ui_text "确认?" "Confirm?")}"; local default="${2:-y}"; local input
+
     while true; do
         if [[ "$default" == "y" ]]; then
             read -r -p "$(echo -e "${C_BOLD}${prompt}${C_RESET} [Y/n]: ")" input || return 1
@@ -418,7 +415,7 @@ ui_confirm() {
         case "$input" in
             y|Y|yes|YES) return 0 ;;
             n|N|no|NO)    return 1 ;;
-            *) echo "  请输入 y 或 n" ;;
+            *) printf '  %s\n' "$(_ui_text "请输入 y 或 n" "Enter y or n")" ;;
         esac
     done
 }
@@ -427,8 +424,8 @@ ui_pause() {
     echo
     # 仅在 stdin 是 tty 时阻塞等用户按键，否则直接返回
     if [ -t 0 ]; then
-        if (( _SM_SERIAL )); then read -r -p 'Press Enter to continue...' _ || true; return 0; fi
-        read -r -N 1 -s -p "$(echo -e "${C_GRAY}按任意键继续...${C_RESET}")" _ || true
+        if (( _SM_SERIAL )); then read -r -p "$(_ui_text "按回车键继续..." "Press Enter to continue...")" _ || true; return 0; fi
+        read -r -N 1 -s -p "${C_GRAY}$(_ui_text "按任意键继续..." "Press any key to continue...")${C_RESET}" _ || true
         echo
     fi
 }
@@ -725,7 +722,7 @@ _save_profile() (
     [[ "$dir" == /* && ! -L "$dir" ]] || return 1
     (umask 077; mkdir -p -- "$dir") || return 1
     [[ $(stat -c %u "$dir") == 0 && $(stat -c %a "$dir") == 700 && ! -L "$_SM_PROFILE_FILE" ]] || {
-        ui_error "Profile directory must be root-owned and mode 0700."; return 1;
+        ui_error "$(_ui_text "实例设置目录必须由 root 所有，权限为 0700。" "Profile directory must be root-owned and mode 0700.")"; return 1;
     }
     tmp=$(mktemp "$dir/.instance.XXXXXXXX") || return 1
     if ! printf '%s\n' "$_SM_PROFILE" "$_SM_DAEMON" "$_SM_CTL" "$SM_MAIN_CONF" "$_SM_UNIT" > "$tmp" ||
@@ -819,43 +816,58 @@ _action_profiles() {
     local before_profile="$_SM_PROFILE" before_daemon="$_SM_DAEMON" before_ctl="$_SM_CTL"
     local before_conf="$SM_MAIN_CONF" before_unit="$_SM_UNIT" before_active="${_SM_ACTIVE_PROFILE:-none}"
     local choice d c f u defaultctl
-    ui_menu "$(_ui_text "Supervisor instance / 实例选择" "Supervisor instance")" \
-        "$(_ui_text "包管理器版本 (Package)" "Package manager version")" "$(_ui_text "MW 面板版本 (MW)" "MW panel version")" "$(_ui_text "手动输入版本 (Manual)" "Manual paths")" "$(_ui_text "自动选择 (Package > MW)" "Automatic (Package > MW)")" || return 0
+    ui_menu "$(_ui_text "Supervisor 实例选择" "Supervisor instance")" \
+        "$(_ui_text "包管理器版本" "Package manager version")" "$(_ui_text "MW 面板版本" "MW panel version")" "$(_ui_text "手动输入版本" "Manual paths")" "$(_ui_text "恢复自动选择（包管理器优先）" "Automatic (Package > MW)")" || return 0
     choice="$_SM_MENU_CHOICE"
     case "$choice" in
         0) return 0;;
         1) _SM_PROFILE=package;;
         2) _SM_PROFILE=mw;;
         3)
-            d=$(_ask_or_abort "$(_ui_text "supervisord absolute path / 主程序路径" "supervisord absolute path")" "$before_daemon") || return 0
+            d=$(_ask_or_abort "$(_ui_text "主程序绝对路径（supervisord）" "supervisord absolute path")" "$before_daemon") || return 0
             defaultctl="${d%/*}/supervisorctl"
-            c=$(_ask_or_abort "$(_ui_text "supervisorctl absolute path / 控制程序路径" "supervisorctl absolute path")" "$defaultctl") || return 0
-            f=$(_ask_or_abort "$(_ui_text "Main config absolute path / 主配置路径" "Main config absolute path")" "$before_conf") || return 0
-            u=$(_ask_or_abort "$(_ui_text "Optional systemd unit (empty = auto) / 可选服务名" "Optional systemd unit (empty = auto)")" "") || return 0
+            c=$(_ask_or_abort "$(_ui_text "控制程序绝对路径（supervisorctl）" "supervisorctl absolute path")" "$defaultctl") || return 0
+            f=$(_ask_or_abort "$(_ui_text "主配置文件绝对路径" "Main config absolute path")" "$before_conf") || return 0
+            u=$(_ask_or_abort "$(_ui_text "可选 systemd 服务名（留空自动识别）" "Optional systemd unit (empty = auto)")" "") || return 0
             _SM_PROFILE=manual; _SM_DAEMON="$d"; _SM_CTL="$c"; SM_MAIN_CONF="$f"; _SM_UNIT="$u"
             ;;
         4) _SM_PROFILE=auto;;
     esac
     _SM_PROFILE_LOCKED=1
     if ! _discover_main_conf || ! _supervisor_python >/dev/null || ! _native_conf validate "$SM_MAIN_CONF" >/dev/null; then
-        ui_error "$(_ui_text "Selected instance is unavailable; keeping previous selection. / 目标不可用，保留原选择" "Selected instance unavailable; keeping previous selection.")"
+        ui_error "$(_ui_text "目标实例不可用，保留原选择" "Selected instance unavailable; keeping previous selection.")"
         _SM_PROFILE="$before_profile"; _SM_DAEMON="$before_daemon"; _SM_CTL="$before_ctl"
         SM_MAIN_CONF="$before_conf"; _SM_UNIT="$before_unit"; _SM_ACTIVE_PROFILE="$before_active"
         _discover_main_conf || true; ui_pause; return 1
     fi
     _show_profile
     if _svctl pid >/dev/null 2>&1 && ! _check_daemon_identity; then
-        ui_warn "$(_ui_text "The configured socket belongs to another or unverified daemon. / socket 实例无法确认" "Configured socket belongs to another or unverified daemon.")"
+        ui_warn "$(_ui_text "当前 socket 对应其他实例或无法验证" "Configured socket belongs to another or unverified daemon.")"
     fi
-    if is_root && ui_confirm "$(_ui_text "Save selection for future sessions? / 保存为下次默认实例?" "Save selection for future sessions?")" "y"; then
-        _save_profile && ui_success "$(_ui_text "Instance selection saved. / 实例选择已保存" "Instance selection saved.")" || ui_error "$(_ui_text "Save failed; current session only. / 保存失败，仅本次生效" "Save failed; current session only.")"
+    if is_root && ui_confirm "$(_ui_text "保存为下次默认实例？" "Save selection for future sessions?")" "y"; then
+        _save_profile && ui_success "$(_ui_text "实例选择已保存" "Instance selection saved.")" || ui_error "$(_ui_text "保存失败，仅本次生效" "Save failed; current session only.")"
     fi
     ui_pause
 }
 
+_profile_name() {
+    case "$1" in
+        package) _ui_text "包管理器版本" "Package manager version";;
+        mw) _ui_text "MW 面板版本" "MW panel version";;
+        manual) _ui_text "手动指定版本" "Manual version";;
+        *) _ui_text "未选择实例" "No instance selected";;
+    esac
+}
+
 _show_profile() {
-    printf '  Instance: %s (%s)\n  supervisord: %s\n  supervisorctl: %s\n  Config: %s\n' \
-        "${_SM_ACTIVE_PROFILE:-none}" "$_SM_PROFILE" "${_SM_DAEMON:--}" "${_SM_CTL:--}" "$SM_MAIN_CONF"
+    local mode
+    if [[ "$_SM_PROFILE" == auto ]]; then mode=$(_ui_text "自动选择" "Automatic")
+    else mode=$(_ui_text "手动选择" "Selected manually"); fi
+    printf '  %s: %s (%s)\n  %s: %s\n  %s: %s\n  %s: %s\n' \
+        "$(_ui_text "当前实例" "Instance")" "$(_profile_name "${_SM_ACTIVE_PROFILE:-none}")" "$mode" \
+        "$(_ui_text "主程序" "supervisord")" "${_SM_DAEMON:--}" \
+        "$(_ui_text "控制程序" "supervisorctl")" "${_SM_CTL:--}" \
+        "$(_ui_text "主配置文件" "Config")" "$SM_MAIN_CONF"
 }
 
 _conf_ready() {
@@ -904,7 +916,7 @@ ui_menu() {
         fi
         local i=1
         for opt in "${options[@]}"; do
-            if (( _SM_SERIAL )); then opt=$(printf '%s' "$opt" | LC_ALL=C tr -cd '\40-\176'); fi
+
             printf "  ${C_CYAN}%2d${C_RESET}) %s\n" "$i" "$opt"
             ((i++))
         done
@@ -1123,31 +1135,37 @@ action_boot() (
     ui_title "$(_ui_text "配置开机自启" "Configure boot service")"
     local svc cur_state=disabled cur_active=inactive
     if [[ $(detect_init) != systemd ]]; then
-        ui_error "Cannot safely identify a matching init service; configure it manually."
+        ui_error "$(_ui_text "无法安全识别对应的启动服务，请手动配置。" "Cannot safely identify a matching init service; configure it manually.")"
         return 1
     fi
     svc=$(_matching_unit) || {
-        ui_error "No unique matching systemd unit. Set the unit name in the instance menu or configure it manually."
+        ui_error "$(_ui_text "未找到唯一匹配的 systemd 服务，请在实例菜单指定服务名或手动配置。" "No unique matching systemd unit. Set the unit name in the instance menu or configure it manually.")"
         return 1
     }
     systemctl is-enabled "$svc" >/dev/null 2>&1 && cur_state=enabled
     systemctl is-active "$svc" >/dev/null 2>&1 && cur_active=active
-    printf '  Service: %s\n  Boot: %s\n  State: %s\n' "$svc" "$cur_state" "$cur_active"
+    local boot_label state_label
+    if [[ "$cur_state" == enabled ]]; then boot_label=$(_ui_text "已启用" "Enabled")
+    else boot_label=$(_ui_text "未启用" "Disabled"); fi
+    if [[ "$cur_active" == active ]]; then state_label=$(_ui_text "运行中" "Running")
+    else state_label=$(_ui_text "未运行" "Inactive"); fi
+    printf '  %s: %s\n  %s: %s\n  %s: %s\n' "$(_ui_text "服务名称" "Service")" "$svc" \
+        "$(_ui_text "开机自启" "Boot")" "$boot_label" "$(_ui_text "运行状态" "State")" "$state_label"
     if [[ "$cur_state" == enabled && "$cur_active" == active ]]; then
-        ui_confirm "$(_ui_text "Disable and stop selected instance? / 禁用并停止当前实例?" "Disable and stop selected instance?")" "n" || return 0
-        supervisor_alive || { ui_error "Selected daemon identity cannot be verified."; return 1; }
+        ui_confirm "$(_ui_text "禁用开机自启并停止当前实例？" "Disable and stop selected instance?")" "n" || return 0
+        supervisor_alive || { ui_error "$(_ui_text "无法验证当前 Supervisor 实例的身份。" "Selected daemon identity cannot be verified.")"; return 1; }
         systemctl disable --now "$svc" || return 1
     else
-        ui_confirm "$(_ui_text "Enable and start selected instance? / 启用并启动当前实例?" "Enable and start selected instance?")" "n" || return 0
+        ui_confirm "$(_ui_text "启用开机自启并启动当前实例？" "Enable and start selected instance?")" "n" || return 0
         _native_conf validate "$SM_MAIN_CONF" || return 1
-        if _svctl pid >/dev/null 2>&1 && ! supervisor_alive; then ui_error "Socket belongs to another daemon."; return 1; fi
+        if _svctl pid >/dev/null 2>&1 && ! supervisor_alive; then ui_error "$(_ui_text "该 socket 属于其他 Supervisor 实例。" "Socket belongs to another daemon.")"; return 1; fi
         systemctl enable --now "$svc" || return 1
         local waited=0
         while (( waited < 20 )); do
-            if supervisor_alive; then ui_success "Selected instance is running."; ui_pause; return 0; fi
+            if supervisor_alive; then ui_success "$(_ui_text "当前实例已启动。" "Selected instance is running.")"; ui_pause; return 0; fi
             sleep 0.5; ((waited++))
         done
-        ui_error "Service started but selected instance did not respond."; return 1
+        ui_error "$(_ui_text "服务已启动，但当前实例未响应。" "Service started but selected instance did not respond.")"; return 1
     fi
     ui_pause
 )
@@ -1172,14 +1190,14 @@ _supervisor_status_raw() {
 # 渲染进程状态表格（首页看板与独立查看共用）
 # 返回 0=正常, 1=supervisord 不可用, 2=无受管进程
 _render_status_table() {
-    if (( _SM_SERIAL )); then
-        if ! has_supervisord; then printf '%s\n' 'No instance selected. Use menu 1 or 12.'; return 1; fi
-        if ! supervisor_alive; then printf '%s\n' 'Selected daemon offline or unverified. Use menu 2 or 12.'; return 1; fi
+    if (( _SM_SERIAL || _SM_ENGLISH )); then
+        if ! has_supervisord; then printf '%s\n' "$(_ui_text "未找到可用实例，请选择 [1] 安装或 [12] 选择实例。" "No instance selected. Use menu 1 or 12.")"; return 1; fi
+        if ! supervisor_alive; then printf '%s\n' "$(_ui_text "当前实例未运行或无法验证，请检查菜单 [2] 或 [12]。" "Selected daemon offline or unverified. Use menu 2 or 12.")"; return 1; fi
         local raw rc=0
         raw=$(_supervisor_status_raw) || rc=$?
-        if (( rc != 0 && rc != 3 )); then printf '%s\n' 'Status query failed.'; return 1; fi
-        if [[ -z "$raw" ]]; then printf '%s\n' 'No managed processes.'; return 2; fi
-        printf '%s\n' "$raw" | LC_ALL=C tr -cd '\11\12\15\40-\176'
+        if (( rc != 0 && rc != 3 )); then printf '%s\n' "$(_ui_text "状态查询失败。" "Status query failed.")"; return 1; fi
+        if [[ -z "$raw" ]]; then printf '%s\n' "$(_ui_text "暂无受管进程。" "No managed processes.")"; return 2; fi
+        printf '%s\n' "$(_ui_text "进程状态：" "Process status:")" "$raw"
         return 0
     fi
     if ! has_supervisord; then
@@ -1511,10 +1529,10 @@ _unit_matches_conf() {
 _restart_supervisor() {
     local svc waited=0
     if [[ $(detect_init) != systemd ]]; then
-        ui_error "Cannot identify an instance-specific service; restart manually."
+        ui_error "$(_ui_text "无法识别当前实例对应的服务，请手动重启。" "Cannot identify an instance-specific service; restart manually.")"
         return 1
     fi
-    svc=$(_matching_unit) || { ui_error "No unique matching systemd service; restart manually."; return 1; }
+    svc=$(_matching_unit) || { ui_error "$(_ui_text "未找到唯一匹配的 systemd 服务，请手动重启。" "No unique matching systemd service; restart manually.")"; return 1; }
     systemctl restart "$svc" || return 1
     while (( waited < 20 )); do
         supervisor_alive && return 0
@@ -2070,7 +2088,7 @@ EOF
 
     require_root || return 1
 
-    ui_title "Self-install"
+    ui_title "$(_ui_text "安装 / 升级 SVM" "Self-install")"
 
     # 安装目录检查
     if [[ ! -d "$install_path" ]]; then
@@ -2138,7 +2156,7 @@ EOF
     echo
     ui_info "$(_ui_text "── 环境检查 ──" "Environment check")"
     if has_supervisord; then
-        ui_info "supervisord 已安装: $("$_SM_DAEMON" --version 2>/dev/null | head -1)"
+        ui_info "$(_ui_text "supervisord 已安装:" "supervisord installed:") $("$_SM_DAEMON" --version 2>/dev/null | head -1)"
         if supervisor_alive; then
             ui_info "$(_ui_text "supervisord 运行中" "supervisord running")"
         else
@@ -2146,15 +2164,19 @@ EOF
         fi
         local svc
         if svc=$(_matching_unit 2>/dev/null); then
-            printf '  Service: %s\n' "$svc"
-            systemctl is-enabled "$svc" 2>/dev/null || true
+            printf '  %s: %s\n' "$(_ui_text "服务名称" "Service")" "$svc"
+            if systemctl is-enabled "$svc" >/dev/null 2>&1; then
+                ui_info "$(_ui_text "开机自启：已启用" "Boot: enabled")"
+            else
+                ui_warn "$(_ui_text "开机自启：未启用" "Boot: not enabled")"
+            fi
         fi
     else
         ui_warn "$(_ui_text "supervisord 未安装，运行 '$final_name' 进菜单 [1] 安装" "No instance selected; use menu 1 or 12 in $final_name")"
     fi
 
     # 提示典型用法
-    if (( _SM_SERIAL )); then
+    if (( _SM_ENGLISH )); then
         printf '\nCommon commands:\n  %s             # interactive menu\n  %s --install   # install/upgrade\n  %s -c status   # show status\n' "$final_name" "$final_name" "$final_name"
         return 0
     fi
@@ -2192,8 +2214,8 @@ self_uninstall() (
     ui_success "$(_ui_text "管理工具已卸载" "Manager removed")"
 )
 usage() {
-    if (( _SM_SERIAL )); then
-        printf 'Supervisor Manager v%s\n  svm                  Interactive menu\n  svm --install        Install/upgrade\n  svm --uninstall      Remove manager only\n  svm -c status        Show status\n  svm --version         Version\n  SM_SERIAL=0 svm      Force normal interface\n  SM_PROFILE=package|mw|auto svm  Select profile (choose one)\n  SM_SUPERVISORD=/path SM_SUPERVISORCTL=/path SM_MAIN_CONF=/path svm\n' "$SM_VERSION"
+    if (( _SM_ENGLISH )); then
+        printf 'Supervisor Manager v%s\n  svm                  Interactive menu\n  svm --install        Install/upgrade\n  svm --uninstall      Remove manager only\n  svm -c status        Show status\n  svm --version         Version\n  SM_SERIAL=0 svm      Force normal interface\n  SM_LANG=zh svm       Chinese interface\n  SM_PROFILE=package|mw|auto svm  Select profile (choose one)\n  SM_SUPERVISORD=/path SM_SUPERVISORCTL=/path SM_MAIN_CONF=/path svm\n' "$SM_VERSION"
         return 0
     fi
     cat <<EOF
@@ -2226,6 +2248,9 @@ ${C_BOLD}Supervisor Manager v$SM_VERSION${C_RESET}
   SM_LOG_DIR                  日志目录
   SM_BACKUP_DIR               编辑/删除前的自动备份目录
   SM_NO_CLEAR=1               禁用首页清屏（保留终端滚动历史）
+  SM_SERIAL=1/0               强制开启/关闭串口简化显示（默认自动识别）
+  SM_LANG=zh/en               界面语言（默认中文，英文可选）
+  SM_COLOR=0                  禁用颜色
   SM_LOCALE=0                 关闭 locale 自适应；SM_LOCALE=<name> 指定 UTF-8 locale
   SM_WIDTH=68                 界面总宽（列数）
 EOF
