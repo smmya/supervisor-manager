@@ -4,6 +4,16 @@
 
 设计目标与 [Supervisord TUI (god)](https://github.com/nicklasos/god) 不同：**不走 TUI 方向**，没有 vim 风格的全屏界面，就是普通的"打印标题 → 列菜单 → read 数字 → 进流程"，跟 `nvm` / `rvm` 那种用户体验类似。
 
+## v1.6.0：串口兼容与多实例选择
+
+- PVE qm terminal 进入 /dev/ttyS* 等串口设备时自动使用简化 ASCII 界面：禁用 ANSI 颜色、清屏和 Unicode 宽度计算，不自动切换 locale。SSH 保持正常中文界面。SM_SERIAL=1/0 可强制开启/关闭；SM_COLOR=0 单独禁用颜色。
+- 菜单 12 可选择包管理器版本、MW 面板版本、手动指定版本、恢复自动选择。默认自动选择顺序为包管理器 > MW；手动输入是显式选择，不会猜测未知路径。切换仅改变管理目标，不启动或停止 daemon。
+- MW 默认配置 /www/server/supervisor/supervisor.conf；优先使用 /www/server/mdserver-web/bin 下的 supervisord、supervisorctl，兼容常见 venv 目录与共享程序路径。MW 日志默认 /www/server/supervisor/log。
+- 手动模式分别设置 supervisord、supervisorctl、主配置和可选 systemd unit。可保存至 /etc/supervisor-manager/instance.conf（root 0600，不作为 shell source）。SM_PROFILE、SM_SUPERVISORD、SM_SUPERVISORCTL、SM_MAIN_CONF、SM_SERVICE 可覆盖选择。
+- 服务启停只允许匹配程序路径和配置路径的唯一 systemd unit；不再猜测或自动创建服务。非 systemd、无法识别的 unit、未带绝对 -c 路径的 daemon 需要人工处理。此保守行为用于避免多实例误操作。
+- 保留每进程 64 MiB 日志预算。修复安装和帮助页字面 \\033 转义显示。
+- 串口模式只约束管理工具界面，不改变外部编辑器、进程日志和配置文件的实际编码。
+
 ## v1.5.0：安全与稳定性更新
 
 - 优先识别运行中的 supervisord 配置、systemd unit 和常见发行版路径；无法确认时使用 `SM_MAIN_CONF=/absolute/path/supervisord.conf svm` 显式选择。

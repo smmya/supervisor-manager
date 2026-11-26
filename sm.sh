@@ -26,7 +26,7 @@
 #  参考 mdserver-web / 宝塔 supervisor 插件功能集，纯 bash 实现。
 #  覆盖：安装、开机自启、状态看板、增删改查、启停重启、日志、配置重载。
 #  v1.3.0：首页直接渲染进程状态看板（不再需要单独进"查看状态"）。
-#  v1.3.1：编辑配置加备份 + 改动检测 + 重载闭环；修复 reread 失败仍报"重载完成"。
+#  v1.3.1：编辑配置加备份 + 改动检测 + 重载闭环；修复 reread 失败仍报"$(_ui_text "重载完成" "Reload complete")"。
 #  v1.3.2：配置定位改以主配置 [include] files 为准——修复 include 指向别处
 #          （如 RHEL 的 /etc/supervisord.d/*.ini）时"编辑/删除"列表全空的问题。
 #  v1.4.0：启动时自动切到 UTF-8 locale（应对 sudo 清空 LANG）；界面按"显示宽度"
@@ -82,11 +82,25 @@ _SM_DW_OK=0
 _SM_TESTING=0
 _SM_PAD=""        # _pad_c / _rule 的输出落点（避免用 $( ) 取结果而 fork）
 
+# Physical serial consoles use plain ASCII; SSH stays in the normal UI.
+_SM_SERIAL=0
+_detect_serial() {
+    case "${SM_SERIAL:-auto}" in
+        1) return 0;;
+        0) return 1;;
+    esac
+    [[ -z "${SSH_CONNECTION:-}" && -z "${SSH_TTY:-}" && -z "${SSH_CLIENT:-}" ]] || return 1
+    local dev
+    dev=$(tty 2>/dev/null) || return 1
+    case "$dev" in /dev/ttyS[0-9]*|/dev/ttyAMA[0-9]*|/dev/hvc[0-9]*|/dev/xvc[0-9]*|/dev/ttyUSB[0-9]*|/dev/ttyACM[0-9]*) return 0;; esac
+    return 1
+}
+if _detect_serial; then _SM_SERIAL=1; fi
 # ---------------------- 颜色 ----------------------
-if [[ -t 1 ]]; then
-    C_RESET="\033[0m"; C_RED="\033[31m"; C_GREEN="\033[32m"; C_YELLOW="\033[33m"
-    C_BLUE="\033[34m"; C_CYAN="\033[36m"; C_GRAY="\033[90m"; C_BOLD="\033[1m"
-    C_BG_BLUE="\033[44m"
+if [[ -t 1 && "$_SM_SERIAL" == 0 && "${SM_COLOR:-1}" != 0 ]]; then
+    C_RESET=$'\033[0m'; C_RED=$'\033[31m'; C_GREEN=$'\033[32m'; C_YELLOW=$'\033[33m'
+    C_BLUE=$'\033[34m'; C_CYAN=$'\033[36m'; C_GRAY=$'\033[90m'; C_BOLD=$'\033[1m'
+    C_BG_BLUE=$'\033[44m'
 else
     C_RESET=""; C_RED=""; C_GREEN=""; C_YELLOW=""; C_BLUE=""
     C_CYAN=""; C_GRAY=""; C_BOLD=""; C_BG_BLUE=""
@@ -238,7 +252,7 @@ _sm_width_selftest() {
     _SM_TESTING=1
     [[ $( (LC_ALL=C; echo ${#_SM_BYTES}) ) -eq 255 ]] || return 1
     [[ "$(_pad "中" 4)"              == "中  "                 ]] || return 1
-    [[ "$(_pad "名称" 8)"            == "名称    "             ]] || return 1
+    [[ "$(_pad "$(_ui_text "名称" "Name")" 8)"            == "名称    "             ]] || return 1
     [[ "$(_pad "ab" 4)"              == "ab  "                 ]] || return 1
     [[ "$(_pad "${e}[31m中${e}[0m" 4)" == "${e}[31m中${e}[0m  " ]] || { _SM_TESTING=0; return 1; }
     [[ "$(_pad "一个很长很长的进程名字超过限制" 10)" == "一个很长.." ]] || { _SM_TESTING=0; return 1; }
@@ -246,7 +260,7 @@ _sm_width_selftest() {
     _SM_DW_OK=1
 }
 
-# 终端比默认宽度窄时收窄界面：只动"名称"列（最宽、也最适合被截断），
+# 终端比默认宽度窄时收窄界面：只动"$(_ui_text "名称" "Name")"列（最宽、也最适合被截断），
 # 其余三列装的是状态/PID/时长，再窄就放不下了。显式设置了 SM_WIDTH 则完全尊重用户。
 _fit_width() {
     (( _SM_WIDTH_AUTO )) || return 0
@@ -349,6 +363,10 @@ ui_line() {
     _rule "$len" "$char"; printf '%s\n' "$_SM_PAD"
 }
 
+_ui_text() {
+    if (( _SM_SERIAL )); then printf '%s' "$2"; else printf '%s' "$1"; fi
+}
+
 ui_title() {
     echo
     echo -e "${C_BG_BLUE}${C_BOLD} $1 ${C_RESET}"
@@ -356,10 +374,19 @@ ui_title() {
 }
 
 # 四种前缀统一成 7 个字符，后面的正文才能左对齐
-ui_info()    { echo -e "${C_GREEN}[INFO]${C_RESET}  $*"; }
-ui_warn()    { echo -e "${C_YELLOW}[WARN]${C_RESET}  $*"; }
-ui_error()   { echo -e "${C_RED}[ERROR]${C_RESET} $*" >&2; }
-ui_success() { echo -e "${C_GREEN}${C_BOLD}[ OK ]${C_RESET}  $*"; }
+_ui_message() {
+    local message="$*"
+    if (( _SM_SERIAL )); then
+        # All primary labels are bilingual. Keep details ASCII in secondary messages.
+        message=$(printf '%s' "$message" | LC_ALL=C tr -cd '\11\12\15\40-\176')
+        [[ -n "$message" && "$message" == *[[:alnum:]]* ]] || message="See SSH session for detailed message."
+    fi
+    printf '%s\n' "$message"
+}
+ui_info()    { _ui_message "${C_GREEN}[INFO]${C_RESET}  $*"; }
+ui_warn()    { _ui_message "${C_YELLOW}[WARN]${C_RESET}  $*"; }
+ui_error()   { _ui_message "${C_RED}[ERROR]${C_RESET} $*" >&2; }
+ui_success() { _ui_message "${C_GREEN}${C_BOLD}[ OK ]${C_RESET}  $*"; }
 
 # ui_ask prompt [default] -> 输出到 stdout
 ui_ask() {
@@ -369,14 +396,16 @@ ui_ask() {
     else
         printf -v p "${C_BOLD}%s${C_RESET}: " "$prompt"
     fi
-    read -r -p "$(echo -e "$p")" input || return 1
+    if (( _SM_SERIAL )); then p=$(printf '%s' "$p" | LC_ALL=C tr -cd '\40-\176'); fi
+    read -r -p "$p" input || return 1
     if [[ -z "$input" && -n "$default" ]]; then echo "$default"
     else printf '%s\n' "$input"; fi
 }
 
 # ui_confirm "提示" [y|n] -> 0=是 1=否
 ui_confirm() {
-    local prompt="${1:-确认?}"; local default="${2:-y}"; local input
+    local prompt="${1:-Confirm?}"; local default="${2:-y}"; local input
+    if (( _SM_SERIAL )); then prompt=$(printf '%s' "$prompt" | LC_ALL=C tr -cd '\40-\176'); [[ -n "$prompt" && "$prompt" == *[[:alnum:]]* ]] || prompt="Confirm action?"; fi
     while true; do
         if [[ "$default" == "y" ]]; then
             read -r -p "$(echo -e "${C_BOLD}${prompt}${C_RESET} [Y/n]: ")" input || return 1
@@ -397,6 +426,7 @@ ui_pause() {
     echo
     # 仅在 stdin 是 tty 时阻塞等用户按键，否则直接返回
     if [ -t 0 ]; then
+        if (( _SM_SERIAL )); then read -r -p 'Press Enter to continue...' _ || true; return 0; fi
         read -r -N 1 -s -p "$(echo -e "${C_GRAY}按任意键继续...${C_RESET}")" _ || true
         echo
     fi
@@ -486,7 +516,7 @@ _supervisor_python() {
         fi
     fi
     # Do not silently use the system Python for a different installation.
-    ui_error "找不到 Supervisor 自带的 Python 解析器" >&2
+    ui_error "$(_ui_text "找不到 Supervisor 自带的 Python 解析器" "Cannot find selected Supervisor Python interpreter")" >&2
     return 1
 }
 
@@ -551,7 +581,7 @@ try:
             else:
                 raise ValueError('unknown mode')
 except Exception as e:
-    print('配置解析失败: %s' % e, file=sys.stderr)
+    print('Configuration parse failed: %s' % e, file=sys.stderr)
     sys.exit(1)
 PY
 }
@@ -575,7 +605,7 @@ _preferred_conf_target() {
         [[ ! -e "$candidate" && ! -L "$candidate" ]] || continue
         _SM_TARGET_FILE="$candidate"; return 0
     done <<< "$patterns"
-    ui_error "无安全的 include 写入目标，或目标已存在"
+    ui_error "$(_ui_text "无安全的 include 写入目标，或目标已存在" "No safe include target, or file exists")"
     return 1
 }
 
@@ -788,19 +818,19 @@ _action_profiles() {
     local before_profile="$_SM_PROFILE" before_daemon="$_SM_DAEMON" before_ctl="$_SM_CTL"
     local before_conf="$SM_MAIN_CONF" before_unit="$_SM_UNIT" before_active="${_SM_ACTIVE_PROFILE:-none}"
     local choice d c f u defaultctl
-    ui_menu "Supervisor instance / 实例选择" \
-        "包管理器版本 (Package)" "MW 面板版本 (MW)" "手动输入版本 (Manual)" "自动选择 (Package > MW)" || return 0
+    ui_menu "$(_ui_text "Supervisor instance / 实例选择" "Supervisor instance")" \
+        "$(_ui_text "包管理器版本 (Package)" "Package manager version")" "$(_ui_text "MW 面板版本 (MW)" "MW panel version")" "$(_ui_text "手动输入版本 (Manual)" "Manual paths")" "$(_ui_text "自动选择 (Package > MW)" "Automatic (Package > MW)")" || return 0
     choice="$_SM_MENU_CHOICE"
     case "$choice" in
         0) return 0;;
         1) _SM_PROFILE=package;;
         2) _SM_PROFILE=mw;;
         3)
-            d=$(_ask_or_abort "supervisord absolute path / 主程序路径" "$before_daemon") || return 0
+            d=$(_ask_or_abort "$(_ui_text "supervisord absolute path / 主程序路径" "supervisord absolute path")" "$before_daemon") || return 0
             defaultctl="${d%/*}/supervisorctl"
-            c=$(_ask_or_abort "supervisorctl absolute path / 控制程序路径" "$defaultctl") || return 0
-            f=$(_ask_or_abort "Main config absolute path / 主配置路径" "$before_conf") || return 0
-            u=$(_ask_or_abort "Optional systemd unit (empty = auto) / 可选服务名" "") || return 0
+            c=$(_ask_or_abort "$(_ui_text "supervisorctl absolute path / 控制程序路径" "supervisorctl absolute path")" "$defaultctl") || return 0
+            f=$(_ask_or_abort "$(_ui_text "Main config absolute path / 主配置路径" "Main config absolute path")" "$before_conf") || return 0
+            u=$(_ask_or_abort "$(_ui_text "Optional systemd unit (empty = auto) / 可选服务名" "Optional systemd unit (empty = auto)")" "") || return 0
             _SM_PROFILE=manual; _SM_DAEMON="$d"; _SM_CTL="$c"; SM_MAIN_CONF="$f"; _SM_UNIT="$u"
             ;;
         4) _SM_PROFILE=auto;;
@@ -816,7 +846,7 @@ _action_profiles() {
     if supervisor_alive && ! _check_daemon_identity; then
         ui_warn "The configured socket belongs to another or unverified daemon. / socket 实例无法确认"
     fi
-    if is_root && ui_confirm "Save selection for future sessions? / 保存为下次默认实例?" "y"; then
+    if is_root && ui_confirm "$(_ui_text "Save selection for future sessions? / 保存为下次默认实例?" "Save selection for future sessions?")" "y"; then
         _save_profile && ui_success "Instance selection saved. / 实例选择已保存" || ui_error "Save failed; current session only. / 保存失败，仅本次生效"
     fi
     ui_pause
@@ -829,9 +859,9 @@ _show_profile() {
 
 _conf_ready() {
     if (( _SM_CONF_AMBIGUOUS )); then
-        ui_error "配置路径不明确；请显式设置 SM_MAIN_CONF" >&2; return 1
+        ui_error "$(_ui_text "配置路径不明确；请显式设置 SM_MAIN_CONF" "Instance not selected; use menu 12 or SM_MAIN_CONF")" >&2; return 1
     fi
-    _valid_profile || { ui_error "未找到主配置或 Supervisor 程序: $SM_MAIN_CONF" >&2; return 1; }
+    _valid_profile || { ui_error "$(_ui_text "未找到主配置或 Supervisor 程序: $SM_MAIN_CONF" "Missing selected program or config: $SM_MAIN_CONF")" >&2; return 1; }
 }
 
 _svctl() {
@@ -853,7 +883,7 @@ _check_daemon_identity() {
 
 ui_menu() {
     local bare=0
-    local zero_label="返回"
+    local zero_label="$(_ui_text "返回" "Back")"
     # 选项前置开关：--bare 只画分隔线（首页看板模式）；--zero 自定义 0 号项文案
     while [[ $# -gt 0 ]]; do
         case "${1:-}" in
@@ -873,13 +903,16 @@ ui_menu() {
         fi
         local i=1
         for opt in "${options[@]}"; do
+            if (( _SM_SERIAL )); then opt=$(printf '%s' "$opt" | LC_ALL=C tr -cd '\40-\176'); fi
             printf "  ${C_CYAN}%2d${C_RESET}) %s\n" "$i" "$opt"
             ((i++))
         done
         echo -e "  ${C_GRAY}0) ${zero_label}${C_RESET}"
         echo
         local choice=""
-        read -r -p "$(echo -e "${C_BOLD}请选择${C_RESET} [0-${#options[@]}]: ")" choice || return 1
+        local selection_prompt
+        selection_prompt=$(_ui_text "请选择" "Select")
+        read -r -p "${C_BOLD}$selection_prompt${C_RESET} [0-${#options[@]}]: " choice || return 1
         # 去除空白（用户可能多按空格）
         choice="${choice// /}"
         # 直接回车 = 不选择，静默重绘（不报错，避免误触时噪音）
@@ -887,11 +920,11 @@ ui_menu() {
             continue
         fi
         if ! [[ "$choice" =~ ^[0-9]+$ ]]; then
-            ui_error "请输入数字"
+            ui_error "$(_ui_text "请输入数字" "Enter a number")"
             continue
         fi
         # 强制十进制，避免 "08" 被 (( )) / [[ -eq ]] 当作非法八进制
-        if (( ${#choice} > 9 )); then ui_error "数字过大"; continue; fi
+        if (( ${#choice} > 9 )); then ui_error "$(_ui_text "数字过大" "Number too large")"; continue; fi
         choice=$((10#$choice))
         if (( choice < 0 || choice > ${#options[@]} )); then
             ui_error "超出范围 [0-${#options[@]}]"
@@ -925,7 +958,7 @@ is_root() { [[ "${EUID:-$(id -u)}" -eq 0 ]]; }
 
 require_root() {
     if ! is_root; then
-        ui_error "此操作需要 root 权限，请使用 sudo 或切换到 root"
+        ui_error "$(_ui_text "此操作需要 root 权限，请使用 sudo 或切换到 root" "Root required; use sudo")"
         ui_pause; return 1
     fi
     return 0
@@ -935,7 +968,7 @@ has_supervisord() { [[ -n "$_SM_DAEMON" && -x "$_SM_DAEMON" ]]; }
 
 # 判断 supervisord 是否可连通（socket 是否响应）
 # 关键：不能用 supervisorctl status —— 任一进程非 RUNNING（FATAL/STOPPED/EXITED/STARTING）
-# 时它返回退出码 3，会把"有异常进程"误判成"supervisord 未运行"。
+# 时它返回退出码 3，会把"有异常进程"误判成"$(_ui_text "supervisord 未运行" "supervisord not running")"。
 # supervisorctl pid 才是可靠的存活探测：socket 通就返回 supervisord 的 PID 且退出 0。
 supervisor_alive() {
     has_supervisord || return 1
@@ -964,7 +997,7 @@ _report_not_alive() {
             ui_info "请用 sudo 运行本工具；不要随意放宽 socket 权限"
             ;;
         not_running)
-            ui_error "supervisord 未运行"
+            ui_error "$(_ui_text "supervisord 未运行" "supervisord not running")"
             ui_info "请执行菜单 [2] 启动并配置开机自启"
             ;;
         *)
@@ -981,7 +1014,7 @@ _report_not_alive() {
 
 action_install() (
     require_root || return 1
-    ui_title "安装 Supervisor"
+    ui_title "$(_ui_text "安装 Supervisor" "Install Supervisor")"
     _lock_mutation || return 1
     if [[ "$_SM_PROFILE" == manual || "$_SM_PROFILE" == mw || "${_SM_ACTIVE_PROFILE:-none}" == mw ]]; then
         ui_warn "请先在实例菜单选择包管理器版本再安装；MW/手动版本由各自安装器维护"
@@ -990,29 +1023,29 @@ action_install() (
 
     if has_supervisord; then
         ui_warn "已检测到 supervisord: $("$_SM_DAEMON" --version 2>/dev/null | head -1)"
-        if ! ui_confirm "是否重新安装/覆盖?" "n"; then return 0; fi
+        if ! ui_confirm "$(_ui_text "是否重新安装/覆盖?" "Reinstall/overwrite?")" "n"; then return 0; fi
     fi
 
     local pkgmgr; pkgmgr=$(detect_pkgmgr)
     case "$pkgmgr" in
         apt)
-            ui_info "使用 apt-get 安装..."
+            ui_info "$(_ui_text "使用 apt-get 安装..." "Installing with apt-get...")"
             apt-get update -y && DEBIAN_FRONTEND=noninteractive apt-get install -y supervisor || return 1
             ;;
         yum)
-            ui_info "使用 yum 安装（先装 EPEL）..."
+            ui_info "$(_ui_text "使用 yum 安装（先装 EPEL）..." "Installing with yum...")"
             yum install -y supervisor || { yum install -y epel-release && yum install -y supervisor; } || return 1
             ;;
         dnf)
-            ui_info "使用 dnf 安装（先装 EPEL）..."
+            ui_info "$(_ui_text "使用 dnf 安装（先装 EPEL）..." "Installing with dnf...")"
             dnf install -y supervisor || { dnf install -y epel-release && dnf install -y supervisor; } || return 1
             ;;
         apk)
-            ui_info "使用 apk 安装..."
+            ui_info "$(_ui_text "使用 apk 安装..." "Installing with apk...")"
             apk add --no-cache supervisor || return 1
             ;;
         pacman)
-            ui_info "使用 pacman 安装..."
+            ui_info "$(_ui_text "使用 pacman 安装..." "Installing with pacman...")"
             pacman -S --noconfirm supervisor || return 1
             ;;
         unknown)
@@ -1024,7 +1057,7 @@ action_install() (
 
     _discover_main_conf || true
     if ! has_supervisord; then
-        ui_error "安装命令执行完毕但 supervisord 不可用，请检查输出"
+        ui_error "$(_ui_text "安装命令执行完毕但 supervisord 不可用，请检查输出" "Install failed: supervisord unavailable")"
         ui_pause; return 1
     fi
     ui_success "supervisor 已安装: $("$_SM_DAEMON" --version 2>/dev/null | head -1)"
@@ -1085,7 +1118,7 @@ EOF
 action_boot() (
     _lock_mutation || return 1
     _conf_ready || return 1
-    ui_title "配置开机自启"
+    ui_title "$(_ui_text "配置开机自启" "Configure boot service")"
     local svc cur_state=disabled cur_active=inactive
     if [[ $(detect_init) != systemd ]]; then
         ui_error "Cannot safely identify a matching init service; configure it manually."
@@ -1099,11 +1132,11 @@ action_boot() (
     systemctl is-active "$svc" >/dev/null 2>&1 && cur_active=active
     printf '  Service: %s\n  Boot: %s\n  State: %s\n' "$svc" "$cur_state" "$cur_active"
     if [[ "$cur_state" == enabled && "$cur_active" == active ]]; then
-        ui_confirm "Disable and stop selected instance? / 禁用并停止当前实例?" "n" || return 0
+        ui_confirm "$(_ui_text "Disable and stop selected instance? / 禁用并停止当前实例?" "Disable and stop selected instance?")" "n" || return 0
         supervisor_alive || { ui_error "Selected daemon identity cannot be verified."; return 1; }
         systemctl disable --now "$svc" || return 1
     else
-        ui_confirm "Enable and start selected instance? / 启用并启动当前实例?" "n" || return 0
+        ui_confirm "$(_ui_text "Enable and start selected instance? / 启用并启动当前实例?" "Enable and start selected instance?")" "n" || return 0
         _native_conf validate "$SM_MAIN_CONF" || return 1
         if _svctl pid >/dev/null 2>&1 && ! supervisor_alive; then ui_error "Socket belongs to another daemon."; return 1; fi
         systemctl enable --now "$svc" || return 1
@@ -1137,6 +1170,16 @@ _supervisor_status_raw() {
 # 渲染进程状态表格（首页看板与独立查看共用）
 # 返回 0=正常, 1=supervisord 不可用, 2=无受管进程
 _render_status_table() {
+    if (( _SM_SERIAL )); then
+        if ! has_supervisord; then printf '%s\n' 'No instance selected. Use menu 1 or 12.'; return 1; fi
+        if ! supervisor_alive; then printf '%s\n' 'Selected daemon offline or unverified. Use menu 2 or 12.'; return 1; fi
+        local raw rc=0
+        raw=$(_supervisor_status_raw) || rc=$?
+        if (( rc != 0 && rc != 3 )); then printf '%s\n' 'Status query failed.'; return 1; fi
+        if [[ -z "$raw" ]]; then printf '%s\n' 'No managed processes.'; return 2; fi
+        printf '%s\n' "$raw" | LC_ALL=C tr -cd '\11\12\15\40-\176'
+        return 0
+    fi
     if ! has_supervisord; then
         echo -e "  ${C_YELLOW}未找到可用实例${C_RESET}  → 请选择 [1] 安装或 [12] 选择实例"
         return 1
@@ -1203,12 +1246,12 @@ _render_status_body() {
     fi
     # 整个函数已在 LC_ALL=C 子 shell 里，直接调 _pad_c 读 _SM_PAD，不走 $( )（每行省 3 次 fork）
     local p1 p2 p3
-    _pad_c "进程状态" 10; printf '  %s%s\n' "$_SM_PAD" "$summary"
+    _pad_c "$(_ui_text "进程状态" "Process status")" 10; printf '  %s%s\n' "$_SM_PAD" "$summary"
 
-    _pad_c "名称" "$_SM_W_NAME";  p1=$_SM_PAD
-    _pad_c "状态" "$_SM_W_STATE"; p2=$_SM_PAD
+    _pad_c "$(_ui_text "名称" "Name")" "$_SM_W_NAME";  p1=$_SM_PAD
+    _pad_c "$(_ui_text "状态" "State")" "$_SM_W_STATE"; p2=$_SM_PAD
     _pad_c "PID"  "$_SM_W_PID";   p3=$_SM_PAD
-    printf '  %s  %s  %s  %s\n' "$p1" "$p2" "$p3" "运行时长"
+    printf '  %s  %s  %s  %s\n' "$p1" "$p2" "$p3" "$(_ui_text "运行时长" "Uptime")"
     _rule "$_SM_W_NAME";  p1=$_SM_PAD
     _rule "$_SM_W_STATE"; p2=$_SM_PAD
     _rule "$_SM_W_PID";   p3=$_SM_PAD
@@ -1249,6 +1292,7 @@ _render_status_body() {
 
 # 清屏（仅 tty 下生效；SM_NO_CLEAR=1 可禁用，便于保留滚动历史）
 _clear_screen() {
+    (( _SM_SERIAL )) && return 0
     if [[ "${SM_NO_CLEAR:-0}" != "1" ]] && [[ -t 1 ]]; then
         printf '\033[2J\033[H'
     fi
@@ -1257,7 +1301,7 @@ _clear_screen() {
 # 独立的"查看状态"屏（首页已自带看板，交互菜单不再用它）
 # 保留原因：source 加载本脚本（SM_NO_ENTRY=1）后，其他脚本可直接调用它打印带标题的状态屏
 action_status() {
-    ui_title "进程状态"
+    ui_title "$(_ui_text "进程状态" "Process status")"
     _render_status_table
     ui_pause
 }
@@ -1284,11 +1328,11 @@ _private_dir() {
 
 _lock_mutation() {
     require_root || return 1
-    _private_dir || { ui_error "无法建立安全备份目录，取消操作"; return 1; }
+    _private_dir || { ui_error "$(_ui_text "无法建立安全备份目录，取消操作" "Cannot create secure backup directory; cancelled")"; return 1; }
     command -v flock >/dev/null 2>&1 || { ui_error "缺少 flock（util-linux）"; return 1; }
     [[ ! -L "$SM_BACKUP_DIR/.lock" ]] || return 1
     exec 9>>"$SM_BACKUP_DIR/.lock" || return 1
-    flock -n 9 || { ui_error "另一 SVM 会话正在修改配置"; return 1; }
+    flock -n 9 || { ui_error "$(_ui_text "另一 SVM 会话正在修改配置" "Another manager session holds the lock")"; return 1; }
 }
 
 _safe_target() {
@@ -1336,22 +1380,22 @@ _tx_begin() {
     _TX_ONLINE=0; _TX_APPLY=0; _TX_MAIN_RESTART=0; _TX_GROUPS=""; _TX_MODE=0600
     _safe_target "$_TX_TARGET" || { ui_error "不安全的目标: $_TX_TARGET"; return 1; }
     _conf_include_patterns >/dev/null || return 1
-    _native_conf validate "$SM_MAIN_CONF" || { ui_error "现有配置无效，请先手动恢复"; return 1; }
+    _native_conf validate "$SM_MAIN_CONF" || { ui_error "$(_ui_text "现有配置无效，请先手动恢复" "Existing configuration invalid; restore manually")"; return 1; }
     if supervisor_alive; then
-        _check_daemon_identity || { ui_error "无法验证本机 Supervisor 实例"; return 1; }
+        _check_daemon_identity || { ui_error "$(_ui_text "无法验证本机 Supervisor 实例" "Cannot verify selected Supervisor instance")"; return 1; }
         local pending
         pending=$(_reread_groups) || return 1
         [[ -z "$pending" ]] || {
-            ui_error "已有未应用的配置修改，请先使用菜单 [9] 或手工处理"
+            ui_error "$(_ui_text "已有未应用的配置修改，请先使用菜单 [9] 或手工处理" "Pending config changes; apply menu 9 or resolve manually")"
             printf '%s\n' "$pending"; return 1;
         }
         _TX_ONLINE=1
     elif [[ -n "$_SM_DAEMON_PID" ]] || _svctl pid >/dev/null 2>&1; then
-        ui_error "发现运行中的 Supervisor 但无法确认连接，拒绝写入"; return 1
+        ui_error "$(_ui_text "发现运行中的 Supervisor 但无法确认连接，拒绝写入" "Selected daemon or socket cannot be verified; refusing changes")"; return 1
     fi
     if [[ -f "$_TX_TARGET" ]]; then
         _TX_MODE=$(stat -c %a -- "$_TX_TARGET") || return 1
-        _TX_BACKUP=$(_backup_file "$_TX_TARGET") || { ui_error "备份失败，取消修改"; return 1; }
+        _TX_BACKUP=$(_backup_file "$_TX_TARGET") || { ui_error "$(_ui_text "备份失败，取消修改" "Backup failed; no changes made")"; return 1; }
         ui_info "已备份: $_TX_BACKUP"
     fi
     _TX_STAGE=$(mktemp "$SM_BACKUP_DIR/.stage.XXXXXXXX") || return 1
@@ -1366,7 +1410,7 @@ _tx_cleanup() {
     trap - EXIT
     trap '' INT TERM
     if (( _TX_DIRTY )); then
-        ui_warn "操作未提交，恢复磁盘配置"
+        ui_warn "$(_ui_text "操作未提交，恢复磁盘配置" "Operation not committed; restoring disk config")"
         local restored=1
         if [[ -n "$_TX_BACKUP" ]]; then
             if _atomic_publish "$_TX_BACKUP" "$_TX_TARGET"; then chmod "$_TX_MODE" -- "$_TX_TARGET" || restored=0; else restored=0; fi
@@ -1374,7 +1418,7 @@ _tx_cleanup() {
             rm -f -- "$_TX_TARGET" || restored=0
         fi
         if (( ! restored )); then
-            ui_error "自动恢复失败！目标: $_TX_TARGET；备份: $_TX_BACKUP"
+            ui_error "$(_ui_text "自动恢复失败！目标: $_TX_TARGET；备份: $_TX_BACKUP" "Rollback failed! Target: $_TX_TARGET; backup: $_TX_BACKUP")"
         elif (( _TX_ONLINE )); then
             if (( _TX_MAIN_RESTART )); then
                 _restart_supervisor || ui_error "磁盘已恢复，但服务重启失败，请人工检查"
@@ -1402,9 +1446,9 @@ _tx_cleanup() {
 
 _tx_publish() {
     if [[ -n "$_TX_BACKUP" ]]; then
-        cmp -s -- "$_TX_TARGET" "$_TX_BACKUP" || { ui_error "配置已被外部修改"; return 1; }
+        cmp -s -- "$_TX_TARGET" "$_TX_BACKUP" || { ui_error "$(_ui_text "配置已被外部修改" "Configuration changed externally")"; return 1; }
     else
-        [[ ! -e "$_TX_TARGET" && ! -L "$_TX_TARGET" ]] || { ui_error "目标已存在"; return 1; }
+        [[ ! -e "$_TX_TARGET" && ! -L "$_TX_TARGET" ]] || { ui_error "$(_ui_text "目标已存在" "Target already exists")"; return 1; }
     fi
     _atomic_publish "$_TX_STAGE" "$_TX_TARGET" || return 1
     _TX_DIRTY=1
@@ -1418,14 +1462,14 @@ _tx_apply() {
             local -a groups=()
             local g remaining
             while IFS= read -r g; do [[ -n "$g" ]] && groups+=("$g"); done <<< "$_TX_GROUPS"
-            ui_info "仅应用变更组: ${groups[*]}"
+            ui_info "$(_ui_text "仅应用变更组: ${groups[*]}" "Apply groups only: ${groups[*]}")"
             _TX_APPLY=1
             _svctl update "${groups[@]}" || return 1
             remaining=$(_reread_groups) || return 1
-            [[ -z "$remaining" ]] || { ui_error "仍有未应用的配置变更"; return 1; }
+            [[ -z "$remaining" ]] || { ui_error "$(_ui_text "仍有未应用的配置变更" "Configuration changes remain pending")"; return 1; }
         fi
     else
-        ui_info "配置已通过离线解析；下次启动时生效"
+        ui_info "$(_ui_text "配置已通过离线解析；下次启动时生效" "Offline config validated; applies on next start")"
     fi
     _TX_DIRTY=0
 }
@@ -1479,10 +1523,10 @@ _restart_supervisor() {
 
 action_add() (
     require_root || return 1
-    ui_title "添加守护进程"
+    ui_title "$(_ui_text "添加守护进程" "Add process")"
 
     if ! has_supervisord; then
-        ui_error "尚未安装 supervisor"
+        ui_error "$(_ui_text "尚未安装 supervisor" "Supervisor not installed")"
         ui_pause; return 1
     fi
 
@@ -1492,7 +1536,7 @@ action_add() (
     local name command user directory autostart autorestart stdout_log stderr_log priority env_str
 
     # 所有后续输入统一做 EOF 保护：任一 read 失败立即中止，避免写出空字段配置
-    name=$(_ask_or_abort "进程名称(英文，作为program段名)") || { ui_pause; return 0; }
+    name=$(_ask_or_abort "$(_ui_text "进程名称(英文，作为program段名)" "Process name (ASCII)")") || { ui_pause; return 0; }
 
     if [[ -z "$name" ]]; then
         ui_error "名称不能为空"
@@ -1511,25 +1555,25 @@ action_add() (
     local conf_dir="${target%/*}"
     local name_rc=0
     _program_exists "$name" || name_rc=$?
-    (( name_rc == 1 )) || { ui_error "名称重复或解析失败"; return 1; }
+    (( name_rc == 1 )) || { ui_error "$(_ui_text "名称重复或解析失败" "Duplicate name or configuration parse failed")"; return 1; }
     if [[ -e "$target" || -L "$target" ]]; then
         ui_error "已存在同名进程 [program:$name]，请改用菜单 [8] 编辑"
         ui_pause; return 1
     fi
 
-    command=$(_ask_or_abort "启动命令" "/usr/local/bin/$name") || { ui_pause; return 0; }
-    user=$(_ask_or_abort "运行用户" "root") || { ui_pause; return 0; }
-    directory=$(_ask_or_abort "工作目录" "/") || { ui_pause; return 0; }
-    autostart=$(_ask_or_abort "随supervisor启动(y/n)" "y") || { ui_pause; return 0; }
-    autorestart=$(_ask_or_abort "自动重启(true/unexpected/false)" "true") || { ui_pause; return 0; }
-    priority=$(_ask_or_abort "启动优先级(数字越小越早)" "999") || { ui_pause; return 0; }
-    stdout_log=$(_ask_or_abort "stdout日志路径" "$SM_LOG_DIR/$name.log") || { ui_pause; return 0; }
-    stderr_log=$(_ask_or_abort "stderr日志路径" "$SM_LOG_DIR/$name-error.log") || { ui_pause; return 0; }
-    env_str=$(_ask_or_abort "环境变量(KEY1=val1,KEY2=val2 可空)" "") || { ui_pause; return 0; }
+    command=$(_ask_or_abort "$(_ui_text "启动命令" "Command")" "/usr/local/bin/$name") || { ui_pause; return 0; }
+    user=$(_ask_or_abort "$(_ui_text "运行用户" "User")" "root") || { ui_pause; return 0; }
+    directory=$(_ask_or_abort "$(_ui_text "工作目录" "Working directory")" "/") || { ui_pause; return 0; }
+    autostart=$(_ask_or_abort "$(_ui_text "随supervisor启动(y/n)" "Autostart (y/n)")" "y") || { ui_pause; return 0; }
+    autorestart=$(_ask_or_abort "$(_ui_text "自动重启(true/unexpected/false)" "Autorestart (true/unexpected/false)")" "true") || { ui_pause; return 0; }
+    priority=$(_ask_or_abort "$(_ui_text "启动优先级(数字越小越早)" "Priority (lower starts earlier)")" "999") || { ui_pause; return 0; }
+    stdout_log=$(_ask_or_abort "$(_ui_text "stdout日志路径" "stdout log path")" "$SM_LOG_DIR/$name.log") || { ui_pause; return 0; }
+    stderr_log=$(_ask_or_abort "$(_ui_text "stderr日志路径" "stderr log path")" "$SM_LOG_DIR/$name-error.log") || { ui_pause; return 0; }
+    env_str=$(_ask_or_abort "$(_ui_text "环境变量(KEY1=val1,KEY2=val2 可空)" "Environment (KEY1=val1,KEY2=val2; optional)")" "") || { ui_pause; return 0; }
 
     # command 是必填项，空配置会让进程直接 FATAL
     if [[ -z "$command" ]]; then
-        ui_error "启动命令不能为空"
+        ui_error "$(_ui_text "启动命令不能为空" "Command cannot be empty")"
         ui_pause; return 1
     fi
     # 优先级必须是非负整数
@@ -1540,17 +1584,17 @@ action_add() (
     # 日志路径建议绝对路径（supervisord 的工作目录与当前 shell 不同）
     if [[ "$stdout_log" != /* || "$stderr_log" != /* ]]; then
         ui_warn "日志路径建议使用绝对路径，相对路径会相对 supervisord 的启动目录解析"
-        if ! ui_confirm "仍要继续?" "n"; then
-            ui_warn "已取消"; ui_pause; return 0
+        if ! ui_confirm "$(_ui_text "仍要继续?" "Continue anyway?")" "n"; then
+            ui_warn "$(_ui_text "已取消" "Cancelled")"; ui_pause; return 0
         fi
     fi
 
     autostart=$(_to_bool "$autostart")
-    case "$autorestart" in true|y|yes) autorestart=true;; unexpected) ;; false|n|no) autorestart=false;; *) ui_error "无效重启策略"; return 1;; esac
-    id "$user" >/dev/null 2>&1 || { ui_error "运行用户不存在"; return 1; }
-    [[ -d "$directory" && "$directory" == /* ]] || { ui_error "工作目录必须为存在的绝对路径"; return 1; }
+    case "$autorestart" in true|y|yes) autorestart=true;; unexpected) ;; false|n|no) autorestart=false;; *) ui_error "$(_ui_text "无效重启策略" "Invalid restart policy")"; return 1;; esac
+    id "$user" >/dev/null 2>&1 || { ui_error "$(_ui_text "运行用户不存在" "User does not exist")"; return 1; }
+    [[ -d "$directory" && "$directory" == /* ]] || { ui_error "$(_ui_text "工作目录必须为存在的绝对路径" "Working directory must be an existing absolute path")"; return 1; }
 
-    ui_title "预览配置"
+    ui_title "$(_ui_text "预览配置" "Preview configuration")"
     echo "[program:$name]"
     echo "command=$command"
     echo "directory=$directory"
@@ -1560,15 +1604,15 @@ action_add() (
     echo "priority=$priority"
     echo "stdout_logfile=$stdout_log"
     echo "stderr_logfile=$stderr_log"
-    [[ -n "$env_str" ]] && echo "environment=（已隐藏）"
+    [[ -n "$env_str" ]] && echo "$(_ui_text "environment=（已隐藏）" "environment=(hidden)")"
     echo
 
-    if ! ui_confirm "确认写入并加载?"; then
-        ui_warn "已取消"; ui_pause; return 0
+    if ! ui_confirm "$(_ui_text "确认写入并加载?" "Write and load configuration?")"; then
+        ui_warn "$(_ui_text "已取消" "Cancelled")"; ui_pause; return 0
     fi
 
     _tx_begin "$target" || return 1
-    [[ -z "$_TX_BACKUP" ]] || { ui_error "目标已存在"; return 1; }
+    [[ -z "$_TX_BACKUP" ]] || { ui_error "$(_ui_text "目标已存在" "Target already exists")"; return 1; }
     name_rc=0; _program_exists "$name" || name_rc=$?
     (( name_rc == 1 )) || return 1
     mkdir -p -- "$(dirname -- "$stdout_log")" "$(dirname -- "$stderr_log")" || return 1
@@ -1584,14 +1628,14 @@ action_add() (
     _tx_publish || return 1
     local files
     files=$(_conf_source_files) || return 1
-    grep -Fxq -- "$target" <<< "$files" || { ui_error "新文件未被 include 匹配"; return 1; }
+    grep -Fxq -- "$target" <<< "$files" || { ui_error "$(_ui_text "新文件未被 include 匹配" "New file not included")"; return 1; }
     _tx_apply || return 1
-    ui_success "配置添加完成: $target"
+    ui_success "$(_ui_text "配置添加完成: $target" "Configuration added: $target")"
     if (( _TX_ONLINE )); then
-        if [[ "$autostart" == false ]] && ui_confirm "是否立即启动?" "n"; then
-            _svctl start "$name" || { ui_error "配置已加载，但启动失败"; return 1; }
+        if [[ "$autostart" == false ]] && ui_confirm "$(_ui_text "是否立即启动?" "Start now?")" "n"; then
+            _svctl start "$name" || { ui_error "$(_ui_text "配置已加载，但启动失败" "Config loaded, process start failed")"; return 1; }
         fi
-        _svctl status "$name" || ui_warn "配置已加载，进程未处于 RUNNING，请查看日志"
+        _svctl status "$name" || ui_warn "$(_ui_text "配置已加载，进程未处于 RUNNING，请查看日志" "Config loaded; process not RUNNING. Check logs")"
     fi
     ui_pause
 
@@ -1610,13 +1654,13 @@ _promote_target() {
     local names=()
     while IFS= read -r n; do names+=("$n"); done < <(_list_proc_names)
     if [[ ${#names[@]} -eq 0 ]]; then
-        ui_error "当前没有受管进程"
+        ui_error "$(_ui_text "当前没有受管进程" "No managed processes")"
         ui_pause; return 1
     fi
     local options=()
     for n in "${names[@]}"; do options+=("$n"); done
-    options+=("全部 (all)")
-    if ! ui_menu "选择要${op}的进程" "${options[@]}"; then return 1; fi
+    options+=("$(_ui_text "全部 (all)" "All (all)")")
+    if ! ui_menu "$(_ui_text "选择要${op}的进程" "Select process to ${op}")" "${options[@]}"; then return 1; fi
     local choice="$_SM_MENU_CHOICE"
     if [[ "$choice" -eq 0 ]]; then return 1; fi
     if [[ "$choice" -eq $(( ${#names[@]} + 1 )) ]]; then
@@ -1627,27 +1671,27 @@ _promote_target() {
     return 0
 }
 
-action_start()   { _action_ctl "启动" "start"; }
-action_stop()    { _action_ctl "停止"  "stop"; }
-action_restart() { _action_ctl "重启"  "restart"; }
+action_start()   { _action_ctl "$(_ui_text "启动" "Start")" "start"; }
+action_stop()    { _action_ctl "$(_ui_text "停止" "Stop")"  "stop"; }
+action_restart() { _action_ctl "$(_ui_text "重启" "Restart")"  "restart"; }
 
 _action_ctl() (
     local op="$1"; local cmd="$2"
-    ui_title "${op}进程"
+    ui_title "$(_ui_text "${op}进程" "${op} process")"
     _lock_mutation || return 1
     if ! supervisor_alive; then
         _report_not_alive; ui_pause; return 1
     fi
     _promote_target "$op" || { ui_pause; return 0; }
     local target="$_SM_TARGET"
-    _check_daemon_identity || { ui_error "无法验证本机 Supervisor 实例"; return 1; }
-    if [[ "$target" == all && "$cmd" != start ]]; then ui_confirm "确认${op}全部进程?" "n" || return 0; fi
-    [[ -n "$target" ]] || { ui_warn "未选择目标"; ui_pause; return 0; }
-    ui_info "执行 supervisorctl $cmd $target ..."
+    _check_daemon_identity || { ui_error "$(_ui_text "无法验证本机 Supervisor 实例" "Cannot verify selected Supervisor instance")"; return 1; }
+    if [[ "$target" == all && "$cmd" != start ]]; then ui_confirm "$(_ui_text "确认${op}全部进程?" "Confirm ${op} all processes?")" "n" || return 0; fi
+    [[ -n "$target" ]] || { ui_warn "$(_ui_text "未选择目标" "No target selected")"; ui_pause; return 0; }
+    ui_info "$(_ui_text "执行 supervisorctl $cmd $target ..." "Run supervisorctl $cmd $target ...")"
     if _svctl "$cmd" "$target"; then
-        ui_success "${op}完成"
+        ui_success "$(_ui_text "${op}完成" "${op} complete")"
     else
-        ui_error "${op}失败"
+        ui_error "$(_ui_text "${op}失败" "${op} failed")"
     fi
     ui_pause
 )
@@ -1657,29 +1701,29 @@ _action_ctl() (
 # ============================================================================
 
 action_log() {
-    ui_title "查看日志"
+    ui_title "$(_ui_text "查看日志" "View logs")"
     if ! supervisor_alive; then
         _report_not_alive; ui_pause; return 1
     fi
     local names=()
     while IFS= read -r n; do names+=("$n"); done < <(_list_proc_names)
     if [[ ${#names[@]} -eq 0 ]]; then
-        ui_error "没有受管进程"; ui_pause; return 1
+        ui_error "$(_ui_text "没有受管进程" "No managed processes")"; ui_pause; return 1
     fi
-    if ! ui_menu "选择进程" "${names[@]}"; then ui_pause; return 0; fi
+    if ! ui_menu "$(_ui_text "选择进程" "Select process")" "${names[@]}"; then ui_pause; return 0; fi
     local choice="$_SM_MENU_CHOICE"
     [[ "$choice" -eq 0 ]] && { ui_pause; return 0; }
     local name="${names[$((choice-1))]}"
 
     local actions=(
-        "查看 stdout 末尾 (tail)"
-        "查看 stderr 末尾 (tail)"
-        "实时跟随 stdout (tail -f)"
-        "实时跟随 stderr (tail -f)"
-        "只读查看 stdout_logfile"
-        "只读查看 stderr_logfile"
+        "$(_ui_text "查看 stdout 末尾 (tail)" "View stdout tail")"
+        "$(_ui_text "查看 stderr 末尾 (tail)" "View stderr tail")"
+        "$(_ui_text "实时跟随 stdout (tail -f)" "Follow stdout")"
+        "$(_ui_text "实时跟随 stderr (tail -f)" "Follow stderr")"
+        "$(_ui_text "只读查看 stdout_logfile" "Read stdout_logfile")"
+        "$(_ui_text "只读查看 stderr_logfile" "Read stderr_logfile")"
     )
-    if ! ui_menu "选择日志动作 [$name]" "${actions[@]}"; then ui_pause; return 0; fi
+    if ! ui_menu "$(_ui_text "选择日志动作 [$name]" "Select log action [$name]")" "${actions[@]}"; then ui_pause; return 0; fi
     local act="$_SM_MENU_CHOICE"
     [[ "$act" -eq 0 ]] && { ui_pause; return 0; }
 
@@ -1729,7 +1773,7 @@ _backup_file() {
 
 # 执行 reread + update，返回 0=成功 1=失败
 # 关键：supervisorctl reread 遇到配置语法错误会打印 ERROR 并以非 0 退出，
-# 若忽略返回值，工具会继续打印"重载完成"，用户以为改动生效了——实际 supervisord
+# 若忽略返回值，工具会继续打印"$(_ui_text "重载完成" "Reload complete")"，用户以为改动生效了——实际 supervisord
 # 仍在用内存里的旧配置。这是"编辑配置后没反应"最常见的原因。
 _do_reload() {
     local out rc
@@ -1779,22 +1823,22 @@ _conf_diag_empty() {
 
 action_edit() (
     require_root || return 1
-    ui_title "编辑进程配置"
+    ui_title "$(_ui_text "编辑进程配置" "Edit process config")"
     local list f file
     list=$(_list_conf_files) || return 1
     local -a files=()
     while IFS= read -r f; do [[ -n "$f" ]] && files+=("$f"); done <<< "$list"
     if (( ${#files[@]} == 0 )); then _conf_diag_empty; ui_pause; return 1; fi
-    ui_menu "选择配置文件（可能包含多个进程）" "${files[@]}" || return 0
+    ui_menu "$(_ui_text "选择配置文件（可能包含多个进程）" "Select config file (may contain multiple processes)")" "${files[@]}" || return 0
     [[ "$_SM_MENU_CHOICE" != 0 ]] || return 0
     file="${files[$((_SM_MENU_CHOICE-1))]}"
     _tx_begin "$file" || return 1
-    _open_editor "$_TX_STAGE" || { ui_error "编辑器退出异常，未修改正式配置"; return 1; }
-    if cmp -s -- "$_TX_STAGE" "$_TX_BACKUP"; then ui_info "配置未改变"; return 0; fi
-    ui_confirm "确认保存并应用配置?" "n" || return 0
+    _open_editor "$_TX_STAGE" || { ui_error "$(_ui_text "编辑器退出异常，未修改正式配置" "Editor failed; original configuration unchanged")"; return 1; }
+    if cmp -s -- "$_TX_STAGE" "$_TX_BACKUP"; then ui_info "$(_ui_text "配置未改变" "Configuration unchanged")"; return 0; fi
+    ui_confirm "$(_ui_text "确认保存并应用配置?" "Save and apply configuration?")" "n" || return 0
     _tx_publish || return 1
     _tx_apply || return 1
-    ui_success "配置修改完成"
+    ui_success "$(_ui_text "配置修改完成" "Configuration updated")"
     ui_pause
 )
 
@@ -1815,40 +1859,40 @@ _conf_entity_names() {
 
 action_delete() (
     require_root || return 1
-    ui_title "删除整个配置文件"
+    ui_title "$(_ui_text "删除整个配置文件" "Delete entire config file")"
     local list f file sections
     list=$(_list_conf_files) || return 1
     local -a files=()
     while IFS= read -r f; do [[ -n "$f" ]] && files+=("$f"); done <<< "$list"
     if (( ${#files[@]} == 0 )); then _conf_diag_empty; return 1; fi
-    ui_menu "选择整个配置文件" "${files[@]}" || return 0
+    ui_menu "$(_ui_text "选择整个配置文件" "Select entire config file")" "${files[@]}" || return 0
     [[ "$_SM_MENU_CHOICE" != 0 ]] || return 0
     file="${files[$((_SM_MENU_CHOICE-1))]}"
     _tx_begin "$file" || return 1
     [[ -n "$_TX_BACKUP" ]] || return 1
     sections=$(_native_conf entities "$_TX_BACKUP") || return 1
-    ui_warn "即将删除 $file 的全部段（不是单个进程）:"
+    ui_warn "$(_ui_text "即将删除 $file 的全部段（不是单个进程）:" "All sections in $file will be removed:")"
     printf '%s\n' "$sections"
-    ui_confirm "确认删除整个文件并停止受影响进程组?" "n" || return 0
-    cmp -s -- "$file" "$_TX_BACKUP" || { ui_error "配置已被外部修改"; return 1; }
+    ui_confirm "$(_ui_text "确认删除整个文件并停止受影响进程组?" "Delete file and stop affected groups?")" "n" || return 0
+    cmp -s -- "$file" "$_TX_BACKUP" || { ui_error "$(_ui_text "配置已被外部修改" "Configuration changed externally")"; return 1; }
     _TX_DIRTY=1
     rm -- "$file" || return 1
     _tx_apply || return 1
-    ui_success "已删除配置文件: $file"
+    ui_success "$(_ui_text "已删除配置文件: $file" "Deleted config: $file")"
     ui_pause
 )
 
 action_reload() (
     _lock_mutation || return 1
-    ui_title "全局重载 Supervisor 配置"
-    _check_daemon_identity || { ui_error "无法验证本机 Supervisor 实例"; return 1; }
+    ui_title "$(_ui_text "全局重载 Supervisor 配置" "Global reload")"
+    _check_daemon_identity || { ui_error "$(_ui_text "无法验证本机 Supervisor 实例" "Cannot verify selected Supervisor instance")"; return 1; }
     _native_conf validate "$SM_MAIN_CONF" || return 1
-    ui_warn "全局 update 可能重启所有存在未应用修改的进程组"
-    ui_confirm "确认全局应用?" "n" || return 0
+    ui_warn "$(_ui_text "全局 update 可能重启所有存在未应用修改的进程组" "Global update may restart groups with pending changes")"
+    ui_confirm "$(_ui_text "确认全局应用?" "Apply all pending changes?")" "n" || return 0
     if _do_reload; then
-        ui_success "重载完成"; _render_status_table
+        ui_success "$(_ui_text "重载完成" "Reload complete")"; _render_status_table
     else
-        ui_error "重载失败或部分应用，请检查实际运行状态"
+        ui_error "$(_ui_text "重载失败或部分应用，请检查实际运行状态" "Reload failed or partially applied; check runtime state")"
         ui_pause; return 1
     fi
     ui_pause
@@ -1856,23 +1900,23 @@ action_reload() (
 
 action_edit_main() (
     require_root || return 1
-    ui_title "编辑主 supervisord.conf"
+    ui_title "$(_ui_text "编辑主 supervisord.conf" "Edit main supervisord.conf")"
     _conf_ready || return 1
     _tx_begin "$SM_MAIN_CONF" || return 1
     _open_editor "$_TX_STAGE" || return 1
-    if cmp -s -- "$_TX_STAGE" "$_TX_BACKUP"; then ui_info "配置未改变"; return 0; fi
-    ui_warn "主配置变更可能影响全部进程；重启会中断业务"
-    ui_confirm "确认保存主配置?" "n" || return 0
+    if cmp -s -- "$_TX_STAGE" "$_TX_BACKUP"; then ui_info "$(_ui_text "配置未改变" "Configuration unchanged")"; return 0; fi
+    ui_warn "$(_ui_text "主配置变更可能影响全部进程；重启会中断业务" "Main config changes and restart may interrupt all processes")"
+    ui_confirm "$(_ui_text "确认保存主配置?" "Save main configuration?")" "n" || return 0
     _tx_publish || return 1
     _native_conf validate "$SM_MAIN_CONF" || return 1
-    if (( _TX_ONLINE )) && ui_confirm "立即重启 Supervisor 并检查连接?" "n"; then
+    if (( _TX_ONLINE )) && ui_confirm "$(_ui_text "立即重启 Supervisor 并检查连接?" "Restart selected Supervisor and check connection?")" "n"; then
         _TX_MAIN_RESTART=1
         _restart_supervisor || return 1
         _TX_DIRTY=0
-        ui_success "已保存并重启"
+        ui_success "$(_ui_text "已保存并重启" "Saved and restarted")"
     else
         _TX_DIRTY=0
-        ui_warn "主配置已保存且通过解析；全局设置需下次重启才能生效"
+        ui_warn "$(_ui_text "主配置已保存且通过解析；全局设置需下次重启才能生效" "Main config saved; restart required for global changes")"
     fi
     ui_pause
 )
@@ -1901,21 +1945,21 @@ main_menu() {
         _show_profile
         _render_status_table
 
-        if ! ui_menu --bare --zero "退出" "" \
-            "安装 Supervisor" \
-            "配置开机自启" \
-            "添加守护进程" \
-            "启动进程" \
-            "停止进程" \
-            "重启进程" \
-            "查看/跟随日志" \
-            "编辑进程配置" \
-            "重载 supervisor 配置 (reread+update)" \
-            "删除守护进程" \
-            "编辑主 supervisord.conf" \
-            "Supervisor 实例选择"; then
+        if ! ui_menu --bare --zero "$(_ui_text "退出" "Exit")" "" \
+            "$(_ui_text "安装 Supervisor" "Install Supervisor")" \
+            "$(_ui_text "配置开机自启" "Configure boot service")" \
+            "$(_ui_text "添加守护进程" "Add process")" \
+            "$(_ui_text "启动进程" "Start process")" \
+            "$(_ui_text "停止进程" "Stop process")" \
+            "$(_ui_text "重启进程" "Restart process")" \
+            "$(_ui_text "查看/跟随日志" "View/follow logs")" \
+            "$(_ui_text "编辑进程配置" "Edit process config")" \
+            "$(_ui_text "重载 supervisor 配置 (reread+update)" "Reload configuration (reread+update)")" \
+            "$(_ui_text "删除守护进程" "Delete process config")" \
+            "$(_ui_text "编辑主 supervisord.conf" "Edit main supervisord.conf")" \
+            "$(_ui_text "Supervisor 实例选择" "Select Supervisor instance")"; then
             # EOF（Ctrl-D / 管道结束）
-            echo "再见"; exit 0
+            echo "$(_ui_text "再见" "Bye")"; exit 0
         fi
         local choice="$_SM_MENU_CHOICE"
         case "$choice" in
@@ -1931,7 +1975,7 @@ main_menu() {
             10) action_delete ;;
             11) action_edit_main ;;
             12) _action_profiles ;;
-            0)  echo "再见"; exit 0 ;;
+            0)  echo "$(_ui_text "再见" "Bye")"; exit 0 ;;
         esac
     done
 }
@@ -2031,7 +2075,7 @@ EOF
         return 1
     fi
 
-    [[ "$install_name" =~ ^[A-Za-z0-9_][A-Za-z0-9_.-]*$ ]] || { ui_error "无效命令名"; return 1; }
+    [[ "$install_name" =~ ^[A-Za-z0-9_][A-Za-z0-9_.-]*$ ]] || { ui_error "$(_ui_text "无效命令名" "Invalid command name")"; return 1; }
     [[ "$install_path" == /* ]] || { ui_error "安装目录必须为绝对路径"; return 1; }
     local final_name="$install_name" target src existing candidate backup tmp version
     local -a candidates=("$install_name")
@@ -2048,29 +2092,29 @@ EOF
                 final_name="$candidate"; break
             done
         fi
-        [[ -n "$final_name" ]] || { ui_error "目标命令冲突"; return 1; }
+        [[ -n "$final_name" ]] || { ui_error "$(_ui_text "目标命令冲突" "Command name conflict")"; return 1; }
     fi
     target="$install_path/$final_name"
-    _safe_target "$target" || { ui_error "不安全的安装目标"; return 1; }
+    _safe_target "$target" || { ui_error "$(_ui_text "不安全的安装目标" "Unsafe installation target")"; return 1; }
     src=$(readlink -f "${BASH_SOURCE[0]}") || return 1
     [[ -f "$src" ]] || return 1
     bash -n "$src" || return 1
     if [[ -f "$target" ]] && cmp -s -- "$src" "$target"; then
-        ui_success "已安装相同内容: $target"; return 0
+        ui_success "$(_ui_text "已安装相同内容: $target" "Already installed: $target")"; return 0
     fi
-    ui_info "安装目标: $target（仅更新管理工具）"
-    ui_confirm "确认安装/升级?" "n" || return 0
+    ui_info "$(_ui_text "安装目标: $target（仅更新管理工具）" "Install target: $target (manager only)")"
+    ui_confirm "$(_ui_text "确认安装/升级?" "Install/upgrade?")" "n" || return 0
     if [[ -e "$target" ]]; then
         version=$(_get_self_version "$target" || true)
         backup=$(mktemp "$target.v${version:-old}.XXXXXXXX") || return 1
-        if ! cp -p -- "$target" "$backup"; then rm -f -- "$backup"; ui_error "备份失败"; return 1; fi
-        ui_info "原文件备份: $backup"
+        if ! cp -p -- "$target" "$backup"; then rm -f -- "$backup"; ui_error "$(_ui_text "备份失败" "Backup failed")"; return 1; fi
+        ui_info "$(_ui_text "原文件备份: $backup" "Backup: $backup")"
     fi
     tmp=$(mktemp "$install_path/.svm-install.XXXXXXXX") || return 1
     if ! install -m 0755 -- "$src" "$tmp" || ! mv -fT -- "$tmp" "$target"; then
-        rm -f -- "$tmp"; ui_error "安装失败"; return 1
+        rm -f -- "$tmp"; ui_error "$(_ui_text "安装失败" "Install failed")"; return 1
     fi
-    ui_success "安装完成: $target"
+    ui_success "$(_ui_text "安装完成: $target" "Installed: $target")"
 
     # PATH 检查
     case ":$PATH:" in
@@ -2081,18 +2125,18 @@ EOF
     # 验证
     if command -v "$final_name" >/dev/null 2>&1; then
         ui_info "验证: $(command -v "$final_name")"
-        ui_info "现在可以直接输入 '$final_name' 启动"
+        ui_info "$(_ui_text "现在可以直接输入 '$final_name' 启动" "Run '$final_name' to start")"
     else
         ui_warn "命令未在 PATH 中找到，需重新登录或 source ~/.bashrc"
     fi
 
     # 升级/安装后的完整性检查：supervisord 与其开机自启状态
     echo
-    ui_info "── 环境检查 ──"
+    ui_info "$(_ui_text "── 环境检查 ──" "Environment check")"
     if has_supervisord; then
         ui_info "supervisord 已安装: $("$_SM_DAEMON" --version 2>/dev/null | head -1)"
         if supervisor_alive; then
-            ui_info "supervisord 运行中"
+            ui_info "$(_ui_text "supervisord 运行中" "supervisord running")"
         else
             ui_warn "supervisord 未运行，运行 '$final_name' 进菜单 [2] 启动"
         fi
@@ -2106,6 +2150,10 @@ EOF
     fi
 
     # 提示典型用法
+    if (( _SM_SERIAL )); then
+        printf '\nCommon commands:\n  %s             # interactive menu\n  %s --install   # install/upgrade\n  %s -c status   # show status\n' "$final_name" "$final_name" "$final_name"
+        return 0
+    fi
     cat <<EOF
 
 ${C_GRAY}── 常用入口 ──${C_RESET}
@@ -2124,12 +2172,16 @@ self_uninstall() (
     require_root || return 1
     local target="${1:-$(readlink -f "${BASH_SOURCE[0]}")}"
     [[ $# -le 1 && "$target" == /* ]] || { ui_error "用法: svm --uninstall [绝对安装路径]"; return 1; }
-    _safe_target "$target" && _is_self_cmd "$target" || { ui_error "拒绝删除非本工具文件"; return 1; }
-    ui_confirm "仅卸载 $target（保留 Supervisor、配置、备份、运行进程）?" "n" || return 0
+    _safe_target "$target" && _is_self_cmd "$target" || { ui_error "$(_ui_text "拒绝删除非本工具文件" "Refusing to delete a file not belonging to SVM")"; return 1; }
+    ui_confirm "$(_ui_text "仅卸载 $target（保留 Supervisor、配置、备份、运行进程）?" "Remove only $target (keep Supervisor, configs, backups and processes)?")" "n" || return 0
     rm -- "$target" || return 1
-    ui_success "管理工具已卸载"
+    ui_success "$(_ui_text "管理工具已卸载" "Manager removed")"
 )
 usage() {
+    if (( _SM_SERIAL )); then
+        printf 'Supervisor Manager v%s\n  svm                  Interactive menu\n  svm --install        Install/upgrade\n  svm --uninstall      Remove manager only\n  svm -c status        Show status\n  svm --version         Version\n  SM_SERIAL=0 svm      Force normal interface\n  SM_PROFILE=package|mw|auto svm  Select profile (choose one)\n  SM_SUPERVISORD=/path SM_SUPERVISORCTL=/path SM_MAIN_CONF=/path svm\n' "$SM_VERSION"
+        return 0
+    fi
     cat <<EOF
 ${C_BOLD}Supervisor Manager v$SM_VERSION${C_RESET}
 
@@ -2170,14 +2222,16 @@ EOF
 # ============================================================================
 
 # 显示宽度计算的字节表 + 自检（纯内建命令，开销可忽略；对所有模式生效）
-_sm_bytes_init
-_sm_width_selftest || true
-_fit_width
+if (( ! _SM_SERIAL )); then
+    _sm_bytes_init
+    _sm_width_selftest || true
+    _fit_width
+fi
 
 # locale 自适应：在任何输出之前把本进程切到 UTF-8
 # source 模式（SM_NO_ENTRY=1）跳过——改调用方的全局环境不是被加载者该做的事
 if [[ "${SM_NO_ENTRY:-0}" != "1" ]]; then
-    _ensure_utf8_locale
+    if (( ! _SM_SERIAL )); then _ensure_utf8_locale; fi
     _discover_main_conf || true
 elif (( _SM_PROFILE_ENV )); then
     _discover_main_conf || true
